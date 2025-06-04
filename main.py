@@ -113,3 +113,14 @@ def create_character(request: CharacterRequest):
         "hp": hp,
         "buffs": buffs
     }
+    
+@app.get("/remind_rules")
+def remind_rules():
+    return {
+        "reminder": (
+            "Reminder: All gameplay must follow the core rules. "
+            "No skipping dice rolls, no fudging results. "
+            "All mechanical actions use the API. "
+            "Storytelling, roleplay, and description are freeform, but outcomes are based on rolls and stats."
+        )
+    }

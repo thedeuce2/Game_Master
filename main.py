@@ -1,10 +1,45 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from pydantic import BaseModel
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 import random
+import re
 
 app = FastAPI()
 
+# --- DICE ROLLER ---
+def parse_dice(dice_expr: str):
+    pattern = r"^(\d*)d(\d+)([+-]\d+)?$"
+    match = re.match(pattern, dice_expr.replace(" ", ""))
+    if not match:
+        return None
+    num = int(match.group(1)) if match.group(1) else 1
+    die = int(match.group(2))
+    mod = int(match.group(3)) if match.group(3) else 0
+    return num, die, mod
+
+@app.get("/roll_dice")
+def roll_dice(
+    dice: str = Query("1d20", description="Dice expression, e.g., '2d6+1', '1d20', '3d8-2'"),
+    label: Optional[str] = Query(None, description="Optional description of the roll")
+) -> Dict[str, Any]:
+    parsed = parse_dice(dice)
+    if not parsed:
+        return {"error": "Invalid dice format. Use NdM+X, e.g., 2d6+1, 1d20, 4d8-2."}
+    num, die, mod = parsed
+    rolls = [random.randint(1, die) for _ in range(num)]
+    total = sum(rolls) + mod
+    result = {
+        "dice": dice,
+        "label": label,
+        "rolls": rolls,
+        "modifier": mod,
+        "total": total
+    }
+    if label:
+        result["label"] = label
+    return result
+
+# --- CHARACTER GENERATOR ---
 def roll_stat():
     dice = [random.randint(1,6) for _ in range(4)]
     dice.remove(min(dice))
@@ -36,7 +71,6 @@ class CharacterResponse(BaseModel):
 @app.post("/create_character", response_model=CharacterResponse)
 def create_character(request: CharacterRequest):
     stats = generate_stats()
-    # Example buff logic: give a bonus to STR for "Half-Orc", DEX for "Elf", etc.
     buffs = []
     if request.race:
         race_lower = request.race.lower()
@@ -53,7 +87,6 @@ def create_character(request: CharacterRequest):
             for k in stats:
                 stats[k] += 1
             buffs.append("Human: +1 to all stats")
-    # Hit points: just 8 + CON for this demo
     hp = 8 + ((stats["constitution"] - 10) // 2)
     return {
         "name": request.name,
@@ -63,11 +96,3 @@ def create_character(request: CharacterRequest):
         "hp": hp,
         "buffs": buffs
     }
-
-@app.get("/")
-def read_root():
-    return {"status": "API is running"}
-
-@app.get("/roll_dice")
-def roll_dice(sides: int = 20):
-    return {"result": random.randint(1, sides)}

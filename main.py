@@ -1,8 +1,10 @@
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Body
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 import random
 import re
+import os
+import json
 
 app = FastAPI()
 

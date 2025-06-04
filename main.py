@@ -6,6 +6,23 @@ import re
 
 app = FastAPI()
 
+GAME_STATE_FILE = "game_state.json"
+
+@app.post("/save_state")
+def save_state(state: dict = Body(...)):
+    # Save the state to a local JSON file
+    with open(GAME_STATE_FILE, "w") as f:
+        json.dump(state, f)
+    return {"status": "saved"}
+
+@app.get("/load_state")
+def load_state():
+    if not os.path.exists(GAME_STATE_FILE):
+        return {"error": "No saved state found"}
+    with open(GAME_STATE_FILE, "r") as f:
+        state = json.load(f)
+    return {"state": state}
+
 # --- DICE ROLLER ---
 def parse_dice(dice_expr: str):
     pattern = r"^(\d*)d(\d+)([+-]\d+)?$"

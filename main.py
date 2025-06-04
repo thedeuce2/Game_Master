@@ -124,3 +124,40 @@ def remind_rules():
             "Storytelling, roleplay, and description are freeform, but outcomes are based on rolls and stats."
         )
     }
+
+from fastapi import Body
+
+@app.post("/advance_relationship")
+def advance_relationship(
+    character_name: str = Body(...),
+    target_name: str = Body(...),
+    stat: str = Body(..., description="Stat to use (e.g., 'charisma')"),
+    difficulty: int = Body(12, description="Difficulty class (DC) for relationship improvement"),
+    bonus: int = Body(0, description="Additional bonus to apply to the roll")
+):
+    # For demo, fake a character sheet; in a real system, fetch from saved state.
+    fake_characters = {
+        "Alice": {"charisma": 14, "wisdom": 10},
+        "Bob": {"charisma": 10, "wisdom": 12}
+    }
+    char_stats = fake_characters.get(character_name, {"charisma": 10, "wisdom": 10})
+    stat_score = char_stats.get(stat.lower(), 10)
+    stat_mod = (stat_score - 10) // 2  # D&D-style modifier
+
+    roll = random.randint(1, 20)
+    total = roll + stat_mod + bonus
+
+    success = total >= difficulty
+    return {
+        "character": character_name,
+        "target": target_name,
+        "stat": stat,
+        "stat_score": stat_score,
+        "stat_mod": stat_mod,
+        "roll": roll,
+        "bonus": bonus,
+        "difficulty": difficulty,
+        "total": total,
+        "success": success,
+        "result": "Relationship improved!" if success else "No improvement this time."
+    }

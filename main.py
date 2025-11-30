@@ -1,792 +1,922 @@
-from fastapi import FastAPI, Query, Body, Path
-from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Any
-import random
-import re
-import os
-import json
-from datetime import datetime
-import uuid
-
-app = FastAPI(
-    title="Life Simulation Backend API",
-    version="4.0",
-    description=(
-        "Event-first backend for a dark, mature life-simulation game. "
-        "Provides dice, character generation, event logging, players, wallets, "
-        "inventory, and meta endpoints for a narrative-heavy Game Master."
-    ),
-)
-
-# -------------------------------------------------------------------
-# Files & constants
-# -------------------------------------------------------------------
-
-GAME_STATE_FILE = "game_state.json"
-EVENT_LOG_FILE = "event_log.jsonl"
-PDF_LOG_META_FILE = "pdf_log_meta.json"
-PLAYERS_FILE = "players.json"
-INTENTS_FILE = "intents.jsonl"
-
-# -------------------------------------------------------------------
-# Utility functions for simple storage
-# -------------------------------------------------------------------
-
-
-def _read_json(path: str, default):
-    if not os.path.exists(path):
-        return default
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _write_json(path: str, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-def _append_jsonl(path: str, obj: dict):
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
-
-
-# -------------------------------------------------------------------
-# Core schema models (matching your OpenAPI)
-# -------------------------------------------------------------------
-
-
-class ActorRef(BaseModel):
-    role: str  # "player", "npc", "system", "gm"
-    playerId: Optional[str] = None
-    npcId: Optional[str] = None
-
-
-class Balance(BaseModel):
-    currency: str
-    amount: float
-
-
-class MoneyDelta(BaseModel):
-    ownerType: str  # "player" | "npc"
-    ownerId: str
-    currency: str
-    amount: float
-    reason: Optional[str] = None
-
-
-class Item(BaseModel):
-    name: str
-    amount: float
-    value: Optional[float] = None
-    props: Optional[Dict[str, Any]] = None
-
-
-class InventoryDelta(BaseModel):
-    ownerType: str  # "player" | "npc"
-    ownerId: str
-    op: str         # "add" | "remove" | "set"
-    item: Item
-    reason: Optional[str] = None
-
-
-class RelationshipDelta(BaseModel):
-    sourceId: str
-    targetId: str
-    targetType: str  # "npc" | "player"
-    attitudeChange: float
-    publicShift: Optional[float] = None
-    notes: Optional[str] = None
-
-
-class KnowledgeScope(BaseModel):
-    visibility: str  # "public" | "private" | "secret"
-    observedByNpcIds: List[str] = Field(default_factory=list)
-    observedByPlayer: bool = True
-    hiddenFromNpcIds: List[str] = Field(default_factory=list)
-    location: Optional[str] = None
-    notes: Optional[str] = None
-
-
-class EventInput(BaseModel):
-    actor: ActorRef
-    type: str
-    summary: str
-    details: Optional[str] = None
-    feeling: Optional[str] = None
-    moneyDeltas: List[MoneyDelta] = Field(default_factory=list)
-    inventoryDeltas: List[InventoryDelta] = Field(default_factory=list)
-    relationshipDeltas: List[RelationshipDelta] = Field(default_factory=list)
-    knowledgeScope: Optional[KnowledgeScope] = None
-
-
-class HistoryQuery(BaseModel):
-    playerId: Optional[str] = None
-    sceneId: Optional[str] = None
-    npcIds: List[str] = Field(default_factory=list)
-    limit: int = 50
-    sort: str = "desc"  # "asc" | "desc"
-
-
-class PrecheckResult(BaseModel):
-    summary: str
-    logicConsistent: bool
-    knowledgeLeaksDetected: bool
-    npcIndividualityMaintained: bool
-    gmAuthorityRespected: bool
-    storyAdvancing: bool
-    errors: List[str] = Field(default_factory=list)
-
-
-class PrecheckLatestProposalData(BaseModel):
-    characterIds: List[str] = Field(default_factory=list)
-    involvedNpcIds: List[str] = Field(default_factory=list)
-    moneyDeltas: List[MoneyDelta] = Field(default_factory=list)
-    inventoryDeltas: List[InventoryDelta] = Field(default_factory=list)
-    relationshipDeltas: List[RelationshipDelta] = Field(default_factory=list)
-
-
-class PrecheckLatestProposal(BaseModel):
-    summary: Optional[str] = None
-    data: Optional[PrecheckLatestProposalData] = None
-
-
-class PrecheckRequest(BaseModel):
-    playerId: Optional[str] = None
-    historyQuery: Optional[HistoryQuery] = None
-    latestProposal: Optional[PrecheckLatestProposal] = None
-    checks: List[str] = Field(default_factory=list)
-
-
-class PlayerStats(BaseModel):
-    money: float = 0.0
-
-
-class Player(BaseModel):
-    playerId: str
-    name: Optional[str] = None
-    location: Optional[str] = None
-    stats: PlayerStats = Field(default_factory=PlayerStats)
-    wallets: List[Balance] = Field(default_factory=list)
-
-
-class Inventory(BaseModel):
-    ownerType: str  # "player" | "npc"
-    ownerId: str
-    items: List[Item] = Field(default_factory=list)
-
-
-class LoggedEvent(BaseModel):
-    eventId: Optional[str] = None
-    timestamp: Optional[str] = None
-    playerId: Optional[str] = None
-    sceneId: Optional[str] = None
-    summary: str
-    detail: Optional[str] = None
-    outcomes: List[EventInput] = Field(default_factory=list)
-    notes: Optional[str] = None
-
-
-class IntentData(BaseModel):
-    summary: str
-    data: Optional[Dict[str, Any]] = None
-
-
-class SubmitIntentRequest(BaseModel):
-    playerId: str
-    intent: IntentData
-    sceneId: Optional[str] = None
-    metadata: Optional[Dict[str, Any]] = None
-
-
-class ResolveReviewConfig(BaseModel):
-    include: bool = True
-    historyQuery: Optional[HistoryQuery] = None
-    checks: List[str] = Field(default_factory=list)
-
-
-class ResolveTurnRequest(BaseModel):
-    playerId: str
-    sceneId: Optional[str] = None
-    basedOnEventIds: List[str] = Field(default_factory=list)
-    outcomes: List[EventInput] = Field(default_factory=list)
-    review: Optional[ResolveReviewConfig] = None
-
-
-# Story references models
-
-class StoryReferencesRequest(BaseModel):
-    description: str
-    tags: Optional[List[str]] = None
-
-
-class StoryReferenceItem(BaseModel):
-    theme: str
-    works: List[str]
-
-
-class StoryReferencesResponse(BaseModel):
-    references: List[StoryReferenceItem]
-
-
-# Character generator models
-
-class CharacterRequest(BaseModel):
-    name: str
-    background: Optional[str] = None
-    race: Optional[str] = None
-
-
-class CharacterResponse(BaseModel):
-    name: str
-    background: Optional[str] = None
-    race: Optional[str] = None
-    stats: Dict[str, int]
-    hp: int
-    buffs: List[str] = Field(default_factory=list)
-
-
-class UpdatePlayerRequest(BaseModel):
-    name: Optional[str] = None
-    location: Optional[str] = None
-    stats: Optional[PlayerStats] = None
-    wallets: Optional[List[Balance]] = None
-
-
-# -------------------------------------------------------------------
-# State save/load
-# -------------------------------------------------------------------
-
-
-@app.post("/save_state")
-def save_state(state: dict = Body(...)):
-    """
-    Save an arbitrary game state blob. Useful as an emergency snapshot.
-    """
-    _write_json(GAME_STATE_FILE, state)
-    return {"status": "saved"}
-
-
-@app.get("/load_state")
-def load_state():
-    if not os.path.exists(GAME_STATE_FILE):
-        return {"error": "No saved state found"}
-    state = _read_json(GAME_STATE_FILE, {})
-    return {"state": state}
-
-
-# -------------------------------------------------------------------
-# Dice roller
-# -------------------------------------------------------------------
-
-
-def parse_dice(dice_expr: str):
-    pattern = r"^(\d*)d(\d+)([+-]\d+)?$"
-    match = re.match(pattern, dice_expr.replace(" ", ""))
-    if not match:
-        return None
-    num = int(match.group(1)) if match.group(1) else 1
-    die = int(match.group(2))
-    mod = int(match.group(3)) if match.group(3) else 0
-    return num, die, mod
-
-
-@app.get("/roll_dice")
-def roll_dice(
-    dice: str = Query(
-        "1d20",
-        description="Dice expression, e.g., '2d6+1', '1d20', '3d8-2'",
-    ),
-    label: Optional[str] = Query(
-        None, description="Optional description of the roll"
-    ),
-) -> Dict[str, Any]:
-    parsed = parse_dice(dice)
-    if not parsed:
-        return {
-            "error": "Invalid dice format. Use NdM+X, e.g., 2d6+1, 1d20, 4d8-2."
-        }
-    num, die, mod = parsed
-    rolls = [random.randint(1, die) for _ in range(num)]
-    total = sum(rolls) + mod
-    result = {
-        "dice": dice,
-        "label": label,
-        "rolls": rolls,
-        "modifier": mod,
-        "total": total,
-    }
-    if label:
-        result["label"] = label
-    return result
-
-
-# -------------------------------------------------------------------
-# Character generator
-# -------------------------------------------------------------------
-
-
-def roll_stat():
-    dice = [random.randint(1, 6) for _ in range(4)]
-    dice.remove(min(dice))
-    return sum(dice)
-
-
-def generate_stats():
-    return {
-        "strength": roll_stat(),
-        "dexterity": roll_stat(),
-        "constitution": roll_stat(),
-        "intelligence": roll_stat(),
-        "wisdom": roll_stat(),
-        "charisma": roll_stat(),
-    }
-
-
-@app.post("/create_character", response_model=CharacterResponse)
-def create_character(request: CharacterRequest):
-    stats = generate_stats()
-    buffs: List[str] = []
-    if request.race:
-        race_lower = request.race.lower()
-        if "orc" in race_lower:
-            stats["strength"] += 2
-            buffs.append("Orc: +2 Strength")
-        elif "elf" in race_lower:
-            stats["dexterity"] += 2
-            buffs.append("Elf: +2 Dexterity")
-        elif "dwarf" in race_lower:
-            stats["constitution"] += 2
-            buffs.append("Dwarf: +2 Constitution")
-        elif "human" in race_lower:
-            for k in stats:
-                stats[k] += 1
-            buffs.append("Human: +1 to all stats")
-    hp = 8 + ((stats["constitution"] - 10) // 2)
-    return {
-        "name": request.name,
-        "background": request.background,
-        "race": request.race,
-        "stats": stats,
-        "hp": hp,
-        "buffs": buffs,
-    }
-
-
-@app.get("/remind_rules")
-def remind_rules():
-    return {
-        "reminder": (
-            "Reminder: All gameplay must follow the core rules. "
-            "No skipping dice rolls, no fudging results. "
-            "All mechanical actions use the API. "
-            "Storytelling, roleplay, and description are freeform, "
-            "but outcomes are based on rolls and stats."
-        )
-    }
-
-
-# -------------------------------------------------------------------
-# Relationship advance (demo)
-# -------------------------------------------------------------------
-
-
-@app.post("/advance_relationship")
-def advance_relationship(
-    character_name: str = Body(...),
-    target_name: str = Body(...),
-    stat: str = Body(..., description="Stat to use (e.g., 'charisma')"),
-    difficulty: int = Body(12, description="Difficulty class (DC)"),
-    bonus: int = Body(0, description="Additional bonus to apply"),
-):
-    # Demo-only stand-in for real character sheets.
-    fake_characters = {
-        "Alice": {"charisma": 14, "wisdom": 10},
-        "Bob": {"charisma": 10, "wisdom": 12},
-    }
-    char_stats = fake_characters.get(
-        character_name, {"charisma": 10, "wisdom": 10}
-    )
-    stat_score = char_stats.get(stat.lower(), 10)
-    stat_mod = (stat_score - 10) // 2  # D&D-style modifier
-
-    roll = random.randint(1, 20)
-    total = roll + stat_mod + bonus
-    success = total >= difficulty
-
-    return {
-        "character": character_name,
-        "target": target_name,
-        "stat": stat,
-        "stat_score": stat_score,
-        "stat_mod": stat_mod,
-        "roll": roll,
-        "bonus": bonus,
-        "difficulty": difficulty,
-        "total": total,
-        "success": success,
-        "result": "Relationship improved!"
-        if success
-        else "No improvement this time.",
-    }
-
-
-# -------------------------------------------------------------------
-# /api/meta/instructions – canonical GM meta-instructions
-# -------------------------------------------------------------------
-
-
-@app.get("/api/meta/instructions")
-def get_meta_instructions():
-    """
-    Returns meta-instructions for the Game Master.
-    The GPT should use these if it wants a backend copy of its role & tone.
-    """
-    return {
-        "version": "1.0.0",
-        "tone": (
-            "Dark, mature, character-driven. Influences: Stephen King, "
-            "Chuck Palahniuk, Caroline Kepnes, Bret Easton Ellis."
-        ),
-        "instructions": (
-            "You are the Game Master of a dark, mature life simulation. "
-            "Maintain player autonomy, individual NPCs, and escalating drama. "
-            'Always call precheck and log tools before responding. '
-            "Never break character; only step out of the game when the user "
-            "speaks in parentheses."
-        ),
-    }
-
-
-# -------------------------------------------------------------------
-# /api/gpt-precheck – required precheck before every narrative response
-# -------------------------------------------------------------------
-
-
-@app.post("/api/gpt-precheck", response_model=PrecheckResult)
-def gpt_precheck(payload: PrecheckRequest):
-    """
-    Lightweight implementation: always marks story as advancing and logic as consistent.
-    The GPT should still treat this as a mandatory precheck before it responds.
-    """
-    summary = payload.latestProposal.summary if payload.latestProposal else ""
-    return PrecheckResult(
-        summary=summary or "No summary provided",
-        logicConsistent=True,
-        knowledgeLeaksDetected=False,
-        npcIndividualityMaintained=True,
-        gmAuthorityRespected=True,
-        storyAdvancing=True,
-        errors=[],
-    )
-
-
-# -------------------------------------------------------------------
-# /api/story/references – literary echoes for scene description
-# -------------------------------------------------------------------
-
-
-@app.post("/api/story/references", response_model=StoryReferencesResponse)
-def get_story_references(req: StoryReferencesRequest):
-    desc_lower = req.description.lower()
-    tags = (req.tags or []) + []
-
-    refs: List[StoryReferenceItem] = []
-
-    if any(t in desc_lower for t in ["small town", "rural", "isolated", "fog"]):
-        refs.append(
-            StoryReferenceItem(
-                theme="Isolated community horror",
-                works=[
-                    "Stephen King – 'Salem's Lot",
-                    "Thomas Tryon – 'Harvest Home'",
-                ],
-            )
-        )
-
-    if any(t in desc_lower for t in ["obsession", "stalker", "parasocial"]):
-        refs.append(
-            StoryReferenceItem(
-                theme="Obsessive, stalkerish POV",
-                works=[
-                    "Caroline Kepnes – 'You'",
-                    "Bret Easton Ellis – 'American Psycho'",
-                ],
-            )
-        )
-
-    if any(t in desc_lower for t in ["body", "violence", "brutal"]):
-        refs.append(
-            StoryReferenceItem(
-                theme="Visceral, bodily horror",
-                works=[
-                    "Chuck Palahniuk – 'Haunted'",
-                    "Clive Barker – 'Books of Blood'",
-                ],
-            )
-        )
-
-    if not refs:
-        refs.append(
-            StoryReferenceItem(
-                theme="Dark, internalized psychological tension",
-                works=[
-                    "Stephen King – 'Misery'",
-                    "Bret Easton Ellis – 'Less Than Zero'",
-                ],
-            )
-        )
-
-    return StoryReferencesResponse(references=refs)
-
-
-# -------------------------------------------------------------------
-# Players: /api/player/{playerId}
-# -------------------------------------------------------------------
-
-
-def _load_players() -> Dict[str, dict]:
-    return _read_json(PLAYERS_FILE, {})
-
-
-def _save_players(players: Dict[str, dict]):
-    _write_json(PLAYERS_FILE, players)
-
-
-@app.get("/api/player/{playerId}", response_model=Player)
-def get_player(
-    playerId: str = Path(..., description="Unique player ID"),
-):
-    players = _load_players()
-    data = players.get(playerId)
-    if not data:
-        # create a minimal default on-the-fly
-        player = Player(playerId=playerId)
-        players[playerId] = player.model_dump()
-        _save_players(players)
-        return player
-    return Player(**data)
-
-
-@app.patch("/api/player/{playerId}", response_model=Player)
-def update_player(
-    playerId: str,
-    payload: UpdatePlayerRequest,
-):
-    players = _load_players()
-    existing = players.get(playerId)
-
-    if existing:
-        player = Player(**existing)
-    else:
-        player = Player(playerId=playerId)
-
-    if payload.name is not None:
-        player.name = payload.name
-    if payload.location is not None:
-        player.location = payload.location
-    if payload.stats is not None:
-        player.stats = payload.stats
-    if payload.wallets is not None:
-        player.wallets = payload.wallets
-
-    players[playerId] = player.model_dump()
-    _save_players(players)
-    return player
-
-
-# -------------------------------------------------------------------
-# Turns: submit intent & resolve
-# -------------------------------------------------------------------
-
-
-@app.post("/api/turns/submit-intent")
-def submit_intent(req: SubmitIntentRequest):
-    """
-    Store the player's declared intent for auditing or offline analysis.
-    """
-    record = req.model_dump()
-    record["timestamp"] = datetime.utcnow().isoformat() + "Z"
-    _append_jsonl(INTENTS_FILE, record)
-    return {"status": "accepted"}
-
-
-@app.post("/api/turns/resolve")
-def resolve_turn(req: ResolveTurnRequest):
-    """
-    Apply outcomes as events. Real logic (wallet updates, NPC state, etc.)
-    can be layered on later by replaying the log.
-    """
-    for outcome in req.outcomes:
-        event = LoggedEvent(
-            eventId=str(uuid.uuid4()),
-            timestamp=datetime.utcnow().isoformat() + "Z",
-            playerId=req.playerId,
-            sceneId=req.sceneId,
-            summary=outcome.summary,
-            detail=outcome.details,
-            outcomes=[outcome],
-        )
-        _append_jsonl(EVENT_LOG_FILE, event.model_dump())
-
-    return {"status": "applied", "numEvents": len(req.outcomes)}
-
-
-# -------------------------------------------------------------------
-# Logs & PDF endpoints
-# -------------------------------------------------------------------
-
-
-@app.post("/api/logs/events")
-def append_event_log(event: LoggedEvent):
-    if event.eventId is None:
-        event.eventId = str(uuid.uuid4())
-    if event.timestamp is None:
-        event.timestamp = datetime.utcnow().isoformat() + "Z"
-
-    _append_jsonl(EVENT_LOG_FILE, event.model_dump())
-    return {"status": "ok", "eventId": event.eventId}
-
-
-@app.get("/api/logs/events")
-def get_event_log(
-    playerId: Optional[str] = Query(None),
-    sceneId: Optional[str] = Query(None),
-    limit: int = Query(50),
-):
-    events: List[dict] = []
-    if os.path.exists(EVENT_LOG_FILE):
-        with open(EVENT_LOG_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    e = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if playerId and e.get("playerId") != playerId:
-                    continue
-                if sceneId and e.get("sceneId") != sceneId:
-                    continue
-                events.append(e)
-
-    events = sorted(
-        events, key=lambda e: e.get("timestamp", ""), reverse=True
-    )
-    return {"events": events[:limit]}
-
-
-@app.get("/api/logs/pdf")
-def get_pdf_log(
-    playerId: Optional[str] = Query(
-        None, description="Optional playerId (reserved for per-player PDFs)"
-    ),
-):
-    """
-    Returns metadata for the latest PDF log.
-    You can update PDF_LOG_META_FILE from a separate script that generates the PDF.
-    """
-    if not os.path.exists(PDF_LOG_META_FILE):
-        return {"pdfUrl": None, "generatedAt": None}
-    meta = _read_json(PDF_LOG_META_FILE, {})
-    return meta
-
-
-# -------------------------------------------------------------------
-# Wallets & inventory: computed from event log
-# -------------------------------------------------------------------
-
-
-@app.get("/api/wallets/{ownerType}/{ownerId}/balances")
-def get_balances(
-    ownerType: str,
-    ownerId: str,
-    currency: Optional[str] = Query(
-        None, description="Filter by specific currency"
-    ),
-):
-    """
-    Compute balances by replaying MoneyDeltas from the event log.
-    """
-    totals: Dict[str, float] = {}
-
-    if os.path.exists(EVENT_LOG_FILE):
-        with open(EVENT_LOG_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                for outcome in entry.get("outcomes", []):
-                    for md in outcome.get("moneyDeltas", []):
-                        if (
-                            md.get("ownerType") == ownerType
-                            and md.get("ownerId") == ownerId
-                        ):
-                            cur = md.get("currency")
-                            amt = float(md.get("amount", 0))
-                            totals[cur] = totals.get(cur, 0.0) + amt
-
-    balances = [
-        {"currency": cur, "amount": amt} for cur, amt in totals.items()
-    ]
-    if currency:
-        balances = [b for b in balances if b["currency"] == currency]
-
-    return {"balances": balances}
-
-
-@app.get("/api/inventory/{ownerType}/{ownerId}/snapshot")
-def get_inventory_snapshot(ownerType: str, ownerId: str):
-    """
-    Compute current inventory by replaying InventoryDeltas from the event log.
-    """
-    stock: Dict[str, Dict[str, Any]] = {}
-
-    if os.path.exists(EVENT_LOG_FILE):
-        with open(EVENT_LOG_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                for outcome in entry.get("outcomes", []):
-                    for invd in outcome.get("inventoryDeltas", []):
-                        if (
-                            invd.get("ownerType") == ownerType
-                            and invd.get("ownerId") == ownerId
-                        ):
-                            op = invd.get("op")
-                            item_data = invd.get("item") or {}
-                            name = item_data.get("name")
-                            if not name:
-                                continue
-
-                            item = stock.get(name) or {
-                                "name": name,
-                                "amount": 0.0,
-                                "value": item_data.get("value"),
-                                "props": item_data.get("props"),
-                            }
-
-                            if op == "add":
-                                item["amount"] = float(
-                                    item.get("amount", 0)
-                                ) + float(item_data.get("amount", 0))
-                            elif op == "remove":
-                                item["amount"] = float(
-                                    item.get("amount", 0)
-                                ) - float(item_data.get("amount", 0))
-                            elif op == "set":
-                                item["amount"] = float(
-                                    item_data.get("amount", 0)
-                                )
-
-                            stock[name] = item
-
-    items = [
-        i for i in stock.values() if float(i.get("amount", 0)) != 0
-    ]
-    return {
-        "ownerType": ownerType,
-        "ownerId": ownerId,
-        "items": items,
-    }
+openapi: 3.1.0
+info:
+  title: Life Simulation Backend API
+  version: "4.0"
+  description: |
+    Event-first backend for a dark, mature life-simulation game.
+
+    CRITICAL USAGE CONTRACT FOR THE GAME MASTER (GPT):
+    - You are always the Game Master of this world, never a generic assistant.
+    - Before EVERY narrative or mechanical response to the player, you MUST:
+      1. Call /api/gpt-precheck with your proposed continuation and checks.
+      2. Apply /api/turns/resolve and /api/logs/events as needed to record outcomes.
+      3. Use /api/logs/events and /api/logs/pdf to maintain continuity with the canonical log.
+    - You must maintain:
+      - Full autonomy for the player over their character.
+      - Distinct, individual NPCs with their own motives and voice.
+      - High drama, conflict, and escalating stakes.
+      - A dark, gripping prose style echoing Stephen King, Chuck Palahniuk,
+        Caroline Kepnes, Bret Easton Ellis. The audience is 18+ and does not
+        need to be coddled.
+    - You never break character as GM. If the user wants to speak outside the
+      game, they will wrap their prompt in parentheses, e.g. (out-of-game question).
+    - You must obey platform safety rules; when a request conflicts with them,
+      you work around it creatively, keeping tone and stakes while omitting or
+      softening only disallowed details.
+
+servers:
+  - url: https://game-master-ngqn.onrender.com
+
+tags:
+  - name: System
+  - name: Precheck
+  - name: Story Tools
+  - name: Players
+  - name: Turns
+  - name: Logs
+  - name: Inventory & Money
+  - name: Utility
+
+paths:
+
+  /save_state:
+    post:
+      tags: [Utility]
+      summary: Save an arbitrary snapshot of game state.
+      operationId: saveState
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: {}
+      responses:
+        '200':
+          description: State saved.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+
+  /load_state:
+    get:
+      tags: [Utility]
+      summary: Load last saved snapshot of game state.
+      operationId: loadState
+      responses:
+        '200':
+          description: Loaded state or error.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  state:
+                    type: object
+                    nullable: true
+                  error:
+                    type: string
+                    nullable: true
+
+  /roll_dice:
+    get:
+      tags: [Utility]
+      summary: Roll dice for mechanical resolution.
+      operationId: rollDice
+      parameters:
+        - name: dice
+          in: query
+          required: false
+          schema:
+            type: string
+            default: "1d20"
+          description: Dice expression, e.g. "2d6+1", "1d20", "3d8-2".
+        - name: label
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Optional description of the roll.
+      responses:
+        '200':
+          description: Dice roll result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  dice: { type: string }
+                  label: { type: string, nullable: true }
+                  rolls:
+                    type: array
+                    items: { type: integer }
+                  modifier: { type: integer }
+                  total: { type: integer }
+                  error: { type: string, nullable: true }
+
+  /create_character:
+    post:
+      tags: [Utility]
+      summary: Generate stats and HP for a character.
+      operationId: createCharacter
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CharacterRequest'
+      responses:
+        '200':
+          description: Generated character.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CharacterResponse'
+
+  /remind_rules:
+    get:
+      tags: [System]
+      summary: Reminder of core mechanical rules.
+      operationId: remindRules
+      responses:
+        '200':
+          description: Rules reminder.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reminder: { type: string }
+
+  /advance_relationship:
+    post:
+      tags: [Utility]
+      summary: Demo endpoint to advance a relationship with a stat-based roll.
+      operationId: advanceRelationship
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                character_name: { type: string }
+                target_name: { type: string }
+                stat:
+                  type: string
+                  description: Stat to use (e.g. "charisma").
+                difficulty:
+                  type: integer
+                  default: 12
+                bonus:
+                  type: integer
+                  default: 0
+      responses:
+        '200':
+          description: Relationship advancement result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  character: { type: string }
+                  target: { type: string }
+                  stat: { type: string }
+                  stat_score: { type: integer }
+                  stat_mod: { type: integer }
+                  roll: { type: integer }
+                  bonus: { type: integer }
+                  difficulty: { type: integer }
+                  total: { type: integer }
+                  success: { type: boolean }
+                  result: { type: string }
+
+  /api/meta/instructions:
+    get:
+      tags: [System]
+      summary: Get canonical meta-instructions for the Game Master.
+      operationId: getMetaInstructions
+      responses:
+        '200':
+          description: Meta instructions for the GM.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version: { type: string }
+                  tone: { type: string }
+                  instructions: { type: string }
+
+  /api/gpt-precheck:
+    post:
+      tags: [Precheck]
+      summary: REQUIRED precheck before EVERY narrative response.
+      description: "Validate the proposed continuation before responding; must be called every turn."
+      operationId: gptPrecheck
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PrecheckRequest'
+      responses:
+        '200':
+          description: Precheck results.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrecheckResult'
+
+  /api/story/references:
+    post:
+      tags: [Story Tools]
+      summary: Get dark literary reference hints for a scene.
+      operationId: getStoryReferences
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StoryReferencesRequest'
+      responses:
+        '200':
+          description: Literary references and themes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StoryReferencesResponse'
+
+  /api/player/{playerId}:
+    get:
+      tags: [Players]
+      summary: Get player data (autocreates minimal default if missing).
+      operationId: getPlayer
+      parameters:
+        - name: playerId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Player object.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Player'
+    patch:
+      tags: [Players]
+      summary: Update player data.
+      operationId: updatePlayer
+      parameters:
+        - name: playerId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdatePlayerRequest'
+      responses:
+        '200':
+          description: Updated player.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Player'
+
+  /api/turns/submit-intent:
+    post:
+      tags: [Turns]
+      summary: Player submits intent for the next action.
+      operationId: submitIntent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubmitIntentRequest'
+      responses:
+        '200':
+          description: Intent accepted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+
+  /api/turns/resolve:
+    post:
+      tags: [Turns]
+      summary: GM resolves NPC/world reactions and applies outcomes.
+      description: "Turn narrative decisions into canonical events and log them for continuity."
+      operationId: resolveTurn
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResolveTurnRequest'
+      responses:
+        '200':
+          description: Outcomes applied.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  numEvents: { type: integer }
+
+  /api/logs/events:
+    post:
+      tags: [Logs]
+      summary: Append a new event to the canonical story log.
+      operationId: appendEventLog
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoggedEvent'
+      responses:
+        '200':
+          description: Event appended.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  eventId: { type: string }
+    get:
+      tags: [Logs]
+      summary: Get recent events for continuity checks.
+      operationId: getEventLog
+      parameters:
+        - name: playerId
+          in: query
+          required: false
+          schema: { type: string }
+        - name: sceneId
+          in: query
+          required: false
+          schema: { type: string }
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 50
+      responses:
+        '200':
+          description: Event log entries.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/LoggedEvent'
+
+  /api/logs/pdf:
+    get:
+      tags: [Logs]
+      summary: Get metadata for the latest PDF log snapshot.
+      operationId: getPdfLog
+      parameters:
+        - name: playerId
+          in: query
+          required: false
+          schema:
+            type: string
+            nullable: true
+      responses:
+        '200':
+          description: Latest PDF log metadata.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pdfUrl:
+                    type: string
+                    nullable: true
+                    description: URL or path to the latest PDF log.
+                  generatedAt:
+                    type: string
+                    format: date-time
+                    nullable: true
+
+  /api/wallets/{ownerType}/{ownerId}/balances:
+    get:
+      tags: [Inventory & Money]
+      summary: Compute current balances by replaying MoneyDeltas from the log.
+      operationId: getBalances
+      parameters:
+        - name: ownerType
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [player, npc]
+        - name: ownerId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: currency
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        '200':
+          description: Balances computed.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  balances:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Balance'
+
+  /api/inventory/{ownerType}/{ownerId}/snapshot:
+    get:
+      tags: [Inventory & Money]
+      summary: Compute current inventory by replaying InventoryDeltas from the log.
+      operationId: getInventorySnapshot
+      parameters:
+        - name: ownerType
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [player, npc]
+        - name: ownerId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Inventory snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Inventory'
+
+components:
+  schemas:
+
+    ActorRole:
+      type: string
+      enum: [player, npc, system, gm]
+
+    ActorRef:
+      type: object
+      properties:
+        role: { $ref: '#/components/schemas/ActorRole' }
+        playerId:
+          type: string
+          nullable: true
+        npcId:
+          type: string
+          nullable: true
+
+    Balance:
+      type: object
+      properties:
+        currency: { type: string }
+        amount: { type: number }
+
+    MoneyDelta:
+      type: object
+      properties:
+        ownerType:
+          type: string
+          enum: [player, npc]
+        ownerId: { type: string }
+        currency: { type: string }
+        amount: { type: number }
+        reason:
+          type: string
+          nullable: true
+
+    Item:
+      type: object
+      properties:
+        name: { type: string }
+        amount: { type: number }
+        value:
+          type: number
+          nullable: true
+        props:
+          type: object
+          nullable: true
+
+    InventoryDelta:
+      type: object
+      properties:
+        ownerType:
+          type: string
+          enum: [player, npc]
+        ownerId: { type: string }
+        op:
+          type: string
+          enum: [add, remove, set]
+        item: { $ref: '#/components/schemas/Item' }
+        reason:
+          type: string
+          nullable: true
+
+    RelationshipDelta:
+      type: object
+      properties:
+        sourceId: { type: string }
+        targetId: { type: string }
+        targetType:
+          type: string
+          enum: [npc, player]
+        attitudeChange: { type: number }
+        publicShift:
+          type: number
+          nullable: true
+        notes:
+          type: string
+          nullable: true
+
+    KnowledgeScope:
+      type: object
+      properties:
+        visibility:
+          type: string
+          enum: [public, private, secret]
+        observedByNpcIds:
+          type: array
+          items: { type: string }
+        observedByPlayer: { type: boolean }
+        hiddenFromNpcIds:
+          type: array
+          items: { type: string }
+        location:
+          type: string
+          nullable: true
+        notes:
+          type: string
+          nullable: true
+
+    PlayerStats:
+      type: object
+      properties:
+        money:
+          type: number
+          default: 0
+
+    Player:
+      type: object
+      properties:
+        playerId: { type: string }
+        name:
+          type: string
+          nullable: true
+        location:
+          type: string
+          nullable: true
+        stats:
+          $ref: '#/components/schemas/PlayerStats'
+        wallets:
+          type: array
+          items: { $ref: '#/components/schemas/Balance' }
+
+    NPC:
+      type: object
+      properties:
+        npcId: { type: string }
+        name:
+          type: string
+          nullable: true
+        location:
+          type: string
+          nullable: true
+        personality:
+          type: array
+          items: { type: string }
+          nullable: true
+        mood:
+          type: string
+          nullable: true
+        relationships:
+          type: array
+          items: { $ref: '#/components/schemas/Relationship' }
+        memories:
+          type: array
+          items: { $ref: '#/components/schemas/Memory' }
+        knowledge:
+          type: array
+          items: { type: string }
+        state:
+          type: object
+          nullable: true
+
+    Relationship:
+      type: object
+      properties:
+        targetId: { type: string }
+        targetType:
+          type: string
+          enum: [npc, player]
+        attitude:
+          type: string
+          nullable: true
+
+    Memory:
+      type: object
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+        summary:
+          type: string
+          nullable: true
+        feeling:
+          type: string
+          nullable: true
+        intensity: { type: number }
+
+    EventInput:
+      type: object
+      properties:
+        actor:
+          $ref: '#/components/schemas/ActorRef'
+        type: { type: string }
+        summary: { type: string }
+        details:
+          type: string
+          nullable: true
+        feeling:
+          type: string
+          nullable: true
+        moneyDeltas:
+          type: array
+          items: { $ref: '#/components/schemas/MoneyDelta' }
+        inventoryDeltas:
+          type: array
+          items: { $ref: '#/components/schemas/InventoryDelta' }
+        relationshipDeltas:
+          type: array
+          items: { $ref: '#/components/schemas/RelationshipDelta' }
+        knowledgeScope:
+          $ref: '#/components/schemas/KnowledgeScope'
+
+    HistoryQuery:
+      type: object
+      properties:
+        playerId:
+          type: string
+          nullable: true
+        sceneId:
+          type: string
+          nullable: true
+        npcIds:
+          type: array
+          items: { type: string }
+        limit:
+          type: integer
+          default: 50
+        sort:
+          type: string
+          enum: [asc, desc]
+          default: "desc"
+
+    PrecheckResult:
+      type: object
+      properties:
+        summary: { type: string }
+        logicConsistent: { type: boolean }
+        knowledgeLeaksDetected: { type: boolean }
+        npcIndividualityMaintained: { type: boolean }
+        gmAuthorityRespected: { type: boolean }
+        storyAdvancing: { type: boolean }
+        errors:
+          type: array
+          items: { type: string }
+
+    PrecheckLatestProposalData:
+      type: object
+      properties:
+        characterIds:
+          type: array
+          items: { type: string }
+        involvedNpcIds:
+          type: array
+          items: { type: string }
+        moneyDeltas:
+          type: array
+          items: { $ref: '#/components/schemas/MoneyDelta' }
+        inventoryDeltas:
+          type: array
+          items: { $ref: '#/components/schemas/InventoryDelta' }
+        relationshipDeltas:
+          type: array
+          items: { $ref: '#/components/schemas/RelationshipDelta' }
+
+    PrecheckLatestProposal:
+      type: object
+      properties:
+        summary:
+          type: string
+          nullable: true
+        data:
+          $ref: '#/components/schemas/PrecheckLatestProposalData'
+
+    PrecheckRequest:
+      type: object
+      properties:
+        playerId:
+          type: string
+          nullable: true
+        historyQuery:
+          $ref: '#/components/schemas/HistoryQuery'
+        latestProposal:
+          $ref: '#/components/schemas/PrecheckLatestProposal'
+        checks:
+          type: array
+          items:
+            type: string
+            enum: [logic, story, knowledge, npcIndividuality, gmAuthority, continuity]
+
+    IntentData:
+      type: object
+      properties:
+        summary: { type: string }
+        data:
+          type: object
+          nullable: true
+
+    SubmitIntentRequest:
+      type: object
+      required: [playerId, intent]
+      properties:
+        playerId: { type: string }
+        intent:
+          $ref: '#/components/schemas/IntentData'
+        sceneId:
+          type: string
+          nullable: true
+        metadata:
+          type: object
+          nullable: true
+
+    ResolveReviewConfig:
+      type: object
+      properties:
+        include:
+          type: boolean
+          default: true
+        historyQuery:
+          $ref: '#/components/schemas/HistoryQuery'
+        checks:
+          type: array
+          items:
+            type: string
+            enum: [logic, story, knowledge, npcIndividuality, gmAuthority, continuity]
+
+    ResolveTurnRequest:
+      type: object
+      required: [playerId, outcomes]
+      properties:
+        playerId: { type: string }
+        sceneId:
+          type: string
+          nullable: true
+        basedOnEventIds:
+          type: array
+          items: { type: string }
+        outcomes:
+          type: array
+          items:
+            $ref: '#/components/schemas/EventInput'
+        review:
+          $ref: '#/components/schemas/ResolveReviewConfig'
+
+    Inventory:
+      type: object
+      properties:
+        ownerType:
+          type: string
+          enum: [player, npc]
+        ownerId: { type: string }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Item' }
+
+    LoggedEvent:
+      type: object
+      description: Canonical record of a single narrative or mechanical event.
+      properties:
+        eventId:
+          type: string
+          nullable: true
+        timestamp:
+          type: string
+          format: date-time
+          nullable: true
+        playerId:
+          type: string
+          nullable: true
+        sceneId:
+          type: string
+          nullable: true
+        summary: { type: string }
+        detail:
+          type: string
+          nullable: true
+        outcomes:
+          type: array
+          items:
+            $ref: '#/components/schemas/EventInput'
+        notes:
+          type: string
+          nullable: true
+
+    StoryReferencesRequest:
+      type: object
+      required: [description]
+      properties:
+        description: { type: string }
+        tags:
+          type: array
+          items: { type: string }
+          nullable: true
+
+    StoryReferenceItem:
+      type: object
+      properties:
+        theme: { type: string }
+        works:
+          type: array
+          items: { type: string }
+
+    StoryReferencesResponse:
+      type: object
+      properties:
+        references:
+          type: array
+          items:
+            $ref: '#/components/schemas/StoryReferenceItem'
+
+    CharacterRequest:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        background:
+          type: string
+          nullable: true
+        race:
+          type: string
+          nullable: true
+
+    CharacterResponse:
+      type: object
+      properties:
+        name: { type: string }
+        background:
+          type: string
+          nullable: true
+        race:
+          type: string
+          nullable: true
+        stats:
+          type: object
+          additionalProperties:
+            type: integer
+        hp: { type: integer }
+        buffs:
+          type: array
+          items: { type: string }
+
+    UpdatePlayerRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          nullable: true
+        location:
+          type: string
+          nullable: true
+        stats:
+          $ref: '#/components/schemas/PlayerStats'
+        wallets:
+          type: array
+          items:
+            $ref: '#/components/schemas/Balance'
 

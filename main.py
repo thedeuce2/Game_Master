@@ -1,4 +1,5 @@
-from fastapi import FastAPI, Query, Body, Path
+from fastapi import FastAPI, Query, Body, Path, Request
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 import random
@@ -8,13 +9,17 @@ import json
 from datetime import datetime
 import uuid
 
+# PDF generation
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
+
 app = FastAPI(
     title="Life Simulation Backend API",
     version="4.0",
     description=(
         "Event-first backend for a dark, mature life-simulation game. "
-        "Provides dice, character generation, event logging, players, wallets, "
-        "inventory, and meta endpoints for a narrative-heavy Game Master."
+        "Provides logging, players, wallets, inventory, and meta endpoints "
+        "for a narrative-heavy Game Master."
     ),
 )
 
@@ -24,9 +29,18 @@ app = FastAPI(
 
 GAME_STATE_FILE = "game_state.json"
 EVENT_LOG_FILE = "event_log.jsonl"
-PDF_LOG_META_FILE = "pdf_log_meta.json"
-PLAYERS_FILE = "players.json"
 INTENTS_FILE = "intents.jsonl"
+PLAYERS_FILE = "players.json"
+
+# PDF logs live under /static/logs so they can be served as files
+STATIC_DIR = "static"
+PDF_DIR = os.path.join(STATIC_DIR, "logs")
+
+# Ensure directories exist at startup
+os.makedirs(PDF_DIR, exist_ok=True)
+
+# Mount /static so PDFs are accessible at /static/...
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 # -------------------------------------------------------------------
 # Utility functions for simple storage
@@ -228,7 +242,7 @@ class StoryReferencesResponse(BaseModel):
     references: List[StoryReferenceItem]
 
 
-# Character generator models
+# Character generator models (still used internally if you want)
 
 class CharacterRequest(BaseModel):
     name: str
@@ -253,7 +267,7 @@ class UpdatePlayerRequest(BaseModel):
 
 
 # -------------------------------------------------------------------
-# State save/load
+# State save/load (kept for completeness; not in schema)
 # -------------------------------------------------------------------
 
 
@@ -275,7 +289,7 @@ def load_state():
 
 
 # -------------------------------------------------------------------
-# Dice roller
+# Dice + character generator (not exposed in trimmed schema, but available)
 # -------------------------------------------------------------------
 
 
@@ -318,11 +332,6 @@ def roll_dice(
     if label:
         result["label"] = label
     return result
-
-
-# -------------------------------------------------------------------
-# Character generator
-# -------------------------------------------------------------------
 
 
 def roll_stat():
@@ -383,11 +392,6 @@ def remind_rules():
             "but outcomes are based on rolls and stats."
         )
     }
-
-
-# -------------------------------------------------------------------
-# Relationship advance (demo)
-# -------------------------------------------------------------------
 
 
 @app.post("/advance_relationship")
@@ -488,8 +492,6 @@ def gpt_precheck(payload: PrecheckRequest):
 @app.post("/api/story/references", response_model=StoryReferencesResponse)
 def get_story_references(req: StoryReferencesRequest):
     desc_lower = req.description.lower()
-    tags = (req.tags or []) + []
-
     refs: List[StoryReferenceItem] = []
 
     if any(t in desc_lower for t in ["small town", "rural", "isolated", "fog"]):
@@ -632,6 +634,77 @@ def resolve_turn(req: ResolveTurnRequest):
 
 
 # -------------------------------------------------------------------
+# PDF generation from log
+# -------------------------------------------------------------------
+
+
+def generate_pdf_from_log(playerId: Optional[str] = None) -> Optional[str]:
+    """
+    Read EVENT_LOG_FILE, filter by playerId if given, and generate a PDF
+    summarizing all events. Returns the full path to the PDF.
+    """
+    events: List[dict] = []
+    if not os.path.exists(EVENT_LOG_FILE):
+        # No events yet; nothing to write
+        return None
+
+    with open(EVENT_LOG_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                e = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if playerId and e.get("playerId") != playerId:
+                continue
+            events.append(e)
+
+    # Sort by timestamp ascending
+    events = sorted(events, key=lambda e: e.get("timestamp", ""))
+
+    # Choose filename: per-player or global
+    if playerId:
+        safe_id = "".join(c for c in playerId if c.isalnum() or c in "-_")
+        filename = f"log_{safe_id}.pdf"
+    else:
+        filename = "log_all.pdf"
+
+    pdf_path = os.path.join(PDF_DIR, filename)
+
+    # Build a simple text PDF
+    c = canvas.Canvas(pdf_path, pagesize=letter)
+    width, height = letter
+    margin = 50
+    y = height - margin
+
+    title = f"Life Simulation Event Log ({playerId or 'all players'})"
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(margin, y, title)
+    y -= 24
+
+    c.setFont("Helvetica", 10)
+    for e in events:
+        ts = e.get("timestamp", "")
+        summary = e.get("summary", "")
+        scene = e.get("sceneId", "")
+        line = f"[{ts}] [scene: {scene}] {summary}"
+        # crude wrapping
+        max_chars = 110
+        chunks = [line[i:i + max_chars] for i in range(0, len(line), max_chars)]
+        for chunk in chunks:
+            if y <= margin:
+                c.showPage()
+                y = height - margin
+                c.setFont("Helvetica", 10)
+            c.drawString(margin, y, chunk)
+            y -= 14
+        # extra space between events
+        y -= 6
+
+    c.save()
+    return pdf_path
+
+
+# -------------------------------------------------------------------
 # Logs & PDF endpoints
 # -------------------------------------------------------------------
 
@@ -675,18 +748,27 @@ def get_event_log(
 
 @app.get("/api/logs/pdf")
 def get_pdf_log(
+    request: Request,
     playerId: Optional[str] = Query(
-        None, description="Optional playerId (reserved for per-player PDFs)"
+        None, description="Optional playerId to filter the log"
     ),
 ):
     """
-    Returns metadata for the latest PDF log.
-    You can update PDF_LOG_META_FILE from a separate script that generates the PDF.
+    Generate (or refresh) a PDF log from the events and return a URL to download it.
+    The GPT should call this after every turn and show pdfUrl to the player.
     """
-    if not os.path.exists(PDF_LOG_META_FILE):
+    pdf_path = generate_pdf_from_log(playerId)
+    if not pdf_path:
         return {"pdfUrl": None, "generatedAt": None}
-    meta = _read_json(PDF_LOG_META_FILE, {})
-    return meta
+
+    generatedAt = datetime.utcnow().isoformat() + "Z"
+
+    # Build a URL like https://host/static/logs/filename.pdf
+    base_url = str(request.base_url).rstrip("/")
+    rel_path = os.path.relpath(pdf_path, STATIC_DIR).replace("\\", "/")
+    pdf_url = f"{base_url}/static/{rel_path}"
+
+    return {"pdfUrl": pdf_url, "generatedAt": generatedAt}
 
 
 # -------------------------------------------------------------------
@@ -789,5 +871,3 @@ def get_inventory_snapshot(ownerType: str, ownerId: str):
         "ownerId": ownerId,
         "items": items,
     }
-
-

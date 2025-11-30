@@ -1,31 +1,248 @@
-from fastapi import FastAPI, Query, Body
-from pydantic import BaseModel
+from fastapi import FastAPI, Query, Body, Path
+from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 import random
 import re
 import os
 import json
+from datetime import datetime
+import uuid
 
-app = FastAPI()
+app = FastAPI(
+    title="Life Simulation Backend API",
+    version="4.0",
+    description=(
+        "Event-first design backend for a custom life simulation game. "
+        "Provides dice, character generation, event logging, players, wallets, inventory, "
+        "and meta endpoints for a dark, narrative-heavy Game Master."
+    ),
+)
+
+# -------------------------------------------------------------------
+# Files & constants
+# -------------------------------------------------------------------
 
 GAME_STATE_FILE = "game_state.json"
+EVENT_LOG_FILE = "event_log.jsonl"
+PDF_LOG_META_FILE = "pdf_log_meta.json"
+PLAYERS_FILE = "players.json"
+INTENTS_FILE = "intents.jsonl"
+
+# -------------------------------------------------------------------
+# Utility functions for simple storage
+# -------------------------------------------------------------------
+
+
+def _read_json(path: str, default):
+    if not os.path.exists(path):
+        return default
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _write_json(path: str, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _append_jsonl(path: str, obj: dict):
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
+# -------------------------------------------------------------------
+# Core schema models (matching your OpenAPI)
+# -------------------------------------------------------------------
+
+
+class ActorRef(BaseModel):
+    role: str  # "player", "npc", "system", "gm"
+    playerId: Optional[str] = None
+    npcId: Optional[str] = None
+
+
+class Balance(BaseModel):
+    currency: str
+    amount: float
+
+
+class MoneyDelta(BaseModel):
+    ownerType: str  # "player" | "npc"
+    ownerId: str
+    currency: str
+    amount: float
+    reason: Optional[str] = None
+
+
+class Item(BaseModel):
+    name: str
+    amount: float
+    value: Optional[float] = None
+    props: Optional[Dict[str, Any]] = None
+
+
+class InventoryDelta(BaseModel):
+    ownerType: str  # "player" | "npc"
+    ownerId: str
+    op: str  # "add" | "remove" | "set"
+    item: Item
+    reason: Optional[str] = None
+
+
+class RelationshipDelta(BaseModel):
+    sourceId: str
+    targetId: str
+    targetType: str  # "npc" | "player"
+    attitudeChange: float
+    publicShift: Optional[float] = None
+    notes: Optional[str] = None
+
+
+class KnowledgeScope(BaseModel):
+    visibility: str  # "public" | "private" | "secret"
+    observedByNpcIds: List[str] = Field(default_factory=list)
+    observedByPlayer: bool = True
+    hiddenFromNpcIds: List[str] = Field(default_factory=list)
+    location: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class EventInput(BaseModel):
+    actor: ActorRef
+    type: str
+    summary: str
+    details: Optional[str] = None
+    feeling: Optional[str] = None
+    moneyDeltas: List[MoneyDelta] = Field(default_factory=list)
+    inventoryDeltas: List[InventoryDelta] = Field(default_factory=list)
+    relationshipDeltas: List[RelationshipDelta] = Field(default_factory=list)
+    knowledgeScope: Optional[KnowledgeScope] = None
+
+
+class HistoryQuery(BaseModel):
+    playerId: Optional[str] = None
+    sceneId: Optional[str] = None
+    npcIds: List[str] = Field(default_factory=list)
+    limit: int = 50
+    sort: str = "desc"  # "asc" | "desc"
+
+
+class PrecheckResult(BaseModel):
+    summary: str
+    logicConsistent: bool
+    knowledgeLeaksDetected: bool
+    npcIndividualityMaintained: bool
+    gmAuthorityRespected: bool
+    storyAdvancing: bool
+    errors: List[str] = Field(default_factory=list)
+
+
+class PrecheckLatestProposalData(BaseModel):
+    characterIds: List[str] = Field(default_factory=list)
+    involvedNpcIds: List[str] = Field(default_factory=list)
+    moneyDeltas: List[MoneyDelta] = Field(default_factory=list)
+    inventoryDeltas: List[InventoryDelta] = Field(default_factory=list)
+    relationshipDeltas: List[RelationshipDelta] = Field(default_factory=list)
+
+
+class PrecheckLatestProposal(BaseModel):
+    summary: Optional[str] = None
+    data: Optional[PrecheckLatestProposalData] = None
+
+
+class PrecheckRequest(BaseModel):
+    playerId: Optional[str] = None
+    historyQuery: Optional[HistoryQuery] = None
+    latestProposal: Optional[PrecheckLatestProposal] = None
+    checks: List[str] = Field(default_factory=list)
+
+
+class PlayerStats(BaseModel):
+    money: float = 0.0
+
+
+class Player(BaseModel):
+    playerId: str
+    name: Optional[str] = None
+    location: Optional[str] = None
+    stats: PlayerStats = Field(default_factory=PlayerStats)
+    wallets: List[Balance] = Field(default_factory=list)
+
+
+class Inventory(BaseModel):
+    ownerType: str  # "player" | "npc"
+    ownerId: str
+    items: List[Item] = Field(default_factory=list)
+
+
+class LoggedEvent(BaseModel):
+    eventId: Optional[str] = None
+    timestamp: Optional[str] = None
+    playerId: Optional[str] = None
+    sceneId: Optional[str] = None
+    summary: str
+    detail: Optional[str] = None
+    outcomes: List[EventInput] = Field(default_factory=list)
+    notes: Optional[str] = None
+
+
+# Turn-related models
+
+
+class IntentData(BaseModel):
+    summary: str
+    data: Optional[Dict[str, Any]] = None
+
+
+class SubmitIntentRequest(BaseModel):
+    playerId: str
+    intent: IntentData
+    sceneId: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class ResolveReviewConfig(BaseModel):
+    include: bool = True
+    historyQuery: Optional[HistoryQuery] = None
+    checks: List[str] = Field(default_factory=list)
+
+
+class ResolveTurnRequest(BaseModel):
+    playerId: str
+    sceneId: Optional[str] = None
+    basedOnEventIds: List[str] = Field(default_factory=list)
+    outcomes: List[EventInput] = Field(default_factory=list)
+    review: Optional[ResolveReviewConfig] = None
+
+
+# -------------------------------------------------------------------
+# Original state save/load
+# -------------------------------------------------------------------
+
 
 @app.post("/save_state")
 def save_state(state: dict = Body(...)):
-    # Save the state to a local JSON file
-    with open(GAME_STATE_FILE, "w") as f:
-        json.dump(state, f)
+    """
+    Save an arbitrary game state blob. This is not part of the event-first schema,
+    but can be useful as an emergency snapshot.
+    """
+    _write_json(GAME_STATE_FILE, state)
     return {"status": "saved"}
+
 
 @app.get("/load_state")
 def load_state():
     if not os.path.exists(GAME_STATE_FILE):
         return {"error": "No saved state found"}
-    with open(GAME_STATE_FILE, "r") as f:
-        state = json.load(f)
+    state = _read_json(GAME_STATE_FILE, {})
     return {"state": state}
 
-# --- DICE ROLLER ---
+
+# -------------------------------------------------------------------
+# Dice roller (original)
+# -------------------------------------------------------------------
+
+
 def parse_dice(dice_expr: str):
     pattern = r"^(\d*)d(\d+)([+-]\d+)?$"
     match = re.match(pattern, dice_expr.replace(" ", ""))
@@ -36,14 +253,22 @@ def parse_dice(dice_expr: str):
     mod = int(match.group(3)) if match.group(3) else 0
     return num, die, mod
 
+
 @app.get("/roll_dice")
 def roll_dice(
-    dice: str = Query("1d20", description="Dice expression, e.g., '2d6+1', '1d20', '3d8-2'"),
-    label: Optional[str] = Query(None, description="Optional description of the roll")
+    dice: str = Query(
+        "1d20",
+        description="Dice expression, e.g., '2d6+1', '1d20', '3d8-2'",
+    ),
+    label: Optional[str] = Query(
+        None, description="Optional description of the roll"
+    ),
 ) -> Dict[str, Any]:
     parsed = parse_dice(dice)
     if not parsed:
-        return {"error": "Invalid dice format. Use NdM+X, e.g., 2d6+1, 1d20, 4d8-2."}
+        return {
+            "error": "Invalid dice format. Use NdM+X, e.g., 2d6+1, 1d20, 4d8-2."
+        }
     num, die, mod = parsed
     rolls = [random.randint(1, die) for _ in range(num)]
     total = sum(rolls) + mod
@@ -52,17 +277,23 @@ def roll_dice(
         "label": label,
         "rolls": rolls,
         "modifier": mod,
-        "total": total
+        "total": total,
     }
     if label:
         result["label"] = label
     return result
 
-# --- CHARACTER GENERATOR ---
+
+# -------------------------------------------------------------------
+# Character generator (original)
+# -------------------------------------------------------------------
+
+
 def roll_stat():
-    dice = [random.randint(1,6) for _ in range(4)]
+    dice = [random.randint(1, 6) for _ in range(4)]
     dice.remove(min(dice))
     return sum(dice)
+
 
 def generate_stats():
     return {
@@ -71,13 +302,15 @@ def generate_stats():
         "constitution": roll_stat(),
         "intelligence": roll_stat(),
         "wisdom": roll_stat(),
-        "charisma": roll_stat()
+        "charisma": roll_stat(),
     }
+
 
 class CharacterRequest(BaseModel):
     name: str
     background: Optional[str] = None
     race: Optional[str] = None
+
 
 class CharacterResponse(BaseModel):
     name: str
@@ -85,12 +318,13 @@ class CharacterResponse(BaseModel):
     race: Optional[str] = None
     stats: Dict[str, int]
     hp: int
-    buffs: Optional[List[str]] = []
+    buffs: List[str] = Field(default_factory=list)
+
 
 @app.post("/create_character", response_model=CharacterResponse)
 def create_character(request: CharacterRequest):
     stats = generate_stats()
-    buffs = []
+    buffs: List[str] = []
     if request.race:
         race_lower = request.race.lower()
         if "orc" in race_lower:
@@ -113,9 +347,10 @@ def create_character(request: CharacterRequest):
         "race": request.race,
         "stats": stats,
         "hp": hp,
-        "buffs": buffs
+        "buffs": buffs,
     }
-    
+
+
 @app.get("/remind_rules")
 def remind_rules():
     return {
@@ -123,33 +358,40 @@ def remind_rules():
             "Reminder: All gameplay must follow the core rules. "
             "No skipping dice rolls, no fudging results. "
             "All mechanical actions use the API. "
-            "Storytelling, roleplay, and description are freeform, but outcomes are based on rolls and stats."
+            "Storytelling, roleplay, and description are freeform, "
+            "but outcomes are based on rolls and stats."
         )
     }
 
-from fastapi import Body
+
+# -------------------------------------------------------------------
+# Relationship advance (original, demo)
+# -------------------------------------------------------------------
+
 
 @app.post("/advance_relationship")
 def advance_relationship(
     character_name: str = Body(...),
     target_name: str = Body(...),
     stat: str = Body(..., description="Stat to use (e.g., 'charisma')"),
-    difficulty: int = Body(12, description="Difficulty class (DC) for relationship improvement"),
-    bonus: int = Body(0, description="Additional bonus to apply to the roll")
+    difficulty: int = Body(12, description="Difficulty class (DC)"),
+    bonus: int = Body(0, description="Additional bonus to apply"),
 ):
-    # For demo, fake a character sheet; in a real system, fetch from saved state.
+    # Demo-only stand-in for real character sheets.
     fake_characters = {
         "Alice": {"charisma": 14, "wisdom": 10},
-        "Bob": {"charisma": 10, "wisdom": 12}
+        "Bob": {"charisma": 10, "wisdom": 12},
     }
-    char_stats = fake_characters.get(character_name, {"charisma": 10, "wisdom": 10})
+    char_stats = fake_characters.get(
+        character_name, {"charisma": 10, "wisdom": 10}
+    )
     stat_score = char_stats.get(stat.lower(), 10)
     stat_mod = (stat_score - 10) // 2  # D&D-style modifier
 
     roll = random.randint(1, 20)
     total = roll + stat_mod + bonus
-
     success = total >= difficulty
+
     return {
         "character": character_name,
         "target": target_name,
@@ -161,5 +403,385 @@ def advance_relationship(
         "difficulty": difficulty,
         "total": total,
         "success": success,
-        "result": "Relationship improved!" if success else "No improvement this time."
+        "result": "Relationship improved!"
+        if success
+        else "No improvement this time.",
+    }
+
+
+# -------------------------------------------------------------------
+# /api/meta/instructions – for the GPT to re-read meta rules
+# -------------------------------------------------------------------
+
+
+@app.get("/api/meta/instructions")
+def get_meta_instructions():
+    return {
+        "version": "1.0.0",
+        "tone": (
+            "Dark, mature, character-driven. Influences: Stephen King, "
+            "Chuck Palahniuk, Caroline Kepnes, Bret Easton Ellis."
+        ),
+        "instructions": (
+            "You are the Game Master of a dark, mature life simulation. "
+            "Maintain player autonomy, individual NPCs, and escalating drama. "
+            "Always call precheck and log tools before responding. "
+            "Never break character; only step out of the game when the user "
+            "speaks in parentheses."
+        ),
+    }
+
+
+# -------------------------------------------------------------------
+# /api/gpt-precheck – required precheck before every narrative response
+# -------------------------------------------------------------------
+
+
+@app.post("/api/gpt-precheck", response_model=PrecheckResult)
+def gpt_precheck(payload: PrecheckRequest):
+    """
+    Lightweight implementation: always marks story as advancing and logic as consistent
+    unless you want to embed real checks. GPT should still *treat* this as mandatory.
+    """
+    summary = payload.latestProposal.summary if payload.latestProposal else ""
+    # You can implement real checks here later.
+    return PrecheckResult(
+        summary=summary or "No summary provided",
+        logicConsistent=True,
+        knowledgeLeaksDetected=False,
+        npcIndividualityMaintained=True,
+        gmAuthorityRespected=True,
+        storyAdvancing=True,
+        errors=[],
+    )
+
+
+# -------------------------------------------------------------------
+# /api/story/references – literary echoes for scene description
+# -------------------------------------------------------------------
+
+
+class StoryReferencesRequest(BaseModel):
+    description: str
+    tags: Optional[List[str]] = None
+
+
+class StoryReferenceItem(BaseModel):
+    theme: str
+    works: List[str]
+
+
+class StoryReferencesResponse(BaseModel):
+    references: List[StoryReferenceItem]
+
+
+@app.post("/api/story/references", response_model=StoryReferencesResponse)
+def get_story_references(req: StoryReferencesRequest):
+    desc_lower = req.description.lower()
+    tags = (req.tags or []) + []
+
+    refs: List[StoryReferenceItem] = []
+
+    if any(t in desc_lower for t in ["small town", "rural", "isolated", "fog"]):
+        refs.append(
+            StoryReferenceItem(
+                theme="Isolated community horror",
+                works=[
+                    "Stephen King – 'Salem's Lot",
+                    "Thomas Tryon – 'Harvest Home'",
+                ],
+            )
+        )
+
+    if any(t in desc_lower for t in ["obsession", "stalker", "parasocial"]):
+        refs.append(
+            StoryReferenceItem(
+                theme="Obsessive, stalkerish POV",
+                works=[
+                    "Caroline Kepnes – 'You'",
+                    "Bret Easton Ellis – 'American Psycho'",
+                ],
+            )
+        )
+
+    if any(t in desc_lower for t in ["body", "violence", "brutal"]):
+        refs.append(
+            StoryReferenceItem(
+                theme="Visceral, bodily horror",
+                works=[
+                    "Chuck Palahniuk – 'Haunted'",
+                    "Clive Barker – 'Books of Blood'",
+                ],
+            )
+        )
+
+    if not refs:
+        refs.append(
+            StoryReferenceItem(
+                theme="Dark, internalized psychological tension",
+                works=[
+                    "Stephen King – 'Misery'",
+                    "Bret Easton Ellis – 'Less Than Zero'",
+                ],
+            )
+        )
+
+    return StoryReferencesResponse(references=refs)
+
+
+# -------------------------------------------------------------------
+# Players: /api/player/{playerId}
+# -------------------------------------------------------------------
+
+
+def _load_players() -> Dict[str, dict]:
+    return _read_json(PLAYERS_FILE, {})
+
+
+def _save_players(players: Dict[str, dict]):
+    _write_json(PLAYERS_FILE, players)
+
+
+@app.get("/api/player/{playerId}", response_model=Player)
+def get_player(
+    playerId: str = Path(..., description="Unique player ID"),
+):
+    players = _load_players()
+    data = players.get(playerId)
+    if not data:
+        # create a minimal default on-the-fly
+        player = Player(playerId=playerId)
+        players[playerId] = player.model_dump()
+        _save_players(players)
+        return player
+    return Player(**data)
+
+
+class UpdatePlayerRequest(BaseModel):
+    name: Optional[str] = None
+    location: Optional[str] = None
+    stats: Optional[PlayerStats] = None
+    wallets: Optional[List[Balance]] = None
+
+
+@app.patch("/api/player/{playerId}", response_model=Player)
+def update_player(
+    playerId: str,
+    payload: UpdatePlayerRequest,
+):
+    players = _load_players()
+    existing = players.get(playerId)
+
+    if existing:
+        player = Player(**existing)
+    else:
+        player = Player(playerId=playerId)
+
+    if payload.name is not None:
+        player.name = payload.name
+    if payload.location is not None:
+        player.location = payload.location
+    if payload.stats is not None:
+        player.stats = payload.stats
+    if payload.wallets is not None:
+        player.wallets = payload.wallets
+
+    players[playerId] = player.model_dump()
+    _save_players(players)
+    return player
+
+
+# -------------------------------------------------------------------
+# Turns: submit intent & resolve
+# -------------------------------------------------------------------
+
+
+@app.post("/api/turns/submit-intent")
+def submit_intent(req: SubmitIntentRequest):
+    record = req.model_dump()
+    record["timestamp"] = datetime.utcnow().isoformat() + "Z"
+    _append_jsonl(INTENTS_FILE, record)
+    return {"status": "accepted"}
+
+
+@app.post("/api/turns/resolve")
+def resolve_turn(req: ResolveTurnRequest):
+    """
+    Apply outcomes as events. Real logic (wallet updates, NPC state, etc.)
+    can be layered on later by replaying the log.
+    """
+    for outcome in req.outcomes:
+        event = LoggedEvent(
+            eventId=str(uuid.uuid4()),
+            timestamp=datetime.utcnow().isoformat() + "Z",
+            playerId=req.playerId,
+            sceneId=req.sceneId,
+            summary=outcome.summary,
+            detail=outcome.details,
+            outcomes=[outcome],
+        )
+        _append_jsonl(EVENT_LOG_FILE, event.model_dump())
+
+    # Optional: run a precheck-like summary
+    return {"status": "applied", "numEvents": len(req.outcomes)}
+
+
+# -------------------------------------------------------------------
+# Logs & PDF endpoints
+# -------------------------------------------------------------------
+
+
+@app.post("/api/logs/events")
+def append_event_log(event: LoggedEvent):
+    if event.eventId is None:
+        event.eventId = str(uuid.uuid4())
+    if event.timestamp is None:
+        event.timestamp = datetime.utcnow().isoformat() + "Z"
+
+    _append_jsonl(EVENT_LOG_FILE, event.model_dump())
+    return {"status": "ok", "eventId": event.eventId}
+
+
+@app.get("/api/logs/events")
+def get_event_log(
+    playerId: Optional[str] = Query(None),
+    sceneId: Optional[str] = Query(None),
+    limit: int = Query(50),
+):
+    events: List[dict] = []
+    if os.path.exists(EVENT_LOG_FILE):
+        with open(EVENT_LOG_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if playerId and e.get("playerId") != playerId:
+                    continue
+                if sceneId and e.get("sceneId") != sceneId:
+                    continue
+                events.append(e)
+
+    events = sorted(
+        events, key=lambda e: e.get("timestamp", ""), reverse=True
+    )
+    return {"events": events[:limit]}
+
+
+@app.get("/api/logs/pdf")
+def get_pdf_log(
+    playerId: Optional[str] = Query(
+        None, description="Optional playerId (reserved for per-player PDFs)"
+    ),
+):
+    """
+    Returns metadata for the latest PDF log. You can update PDF_LOG_META_FILE
+    from a separate script that generates the PDF from EVENT_LOG_FILE.
+    """
+    if not os.path.exists(PDF_LOG_META_FILE):
+        return {"pdfUrl": None, "generatedAt": None}
+    meta = _read_json(PDF_LOG_META_FILE, {})
+    return meta
+
+
+# -------------------------------------------------------------------
+# Wallets & inventory: computed from event log
+# -------------------------------------------------------------------
+
+
+@app.get("/api/wallets/{ownerType}/{ownerId}/balances")
+def get_balances(
+    ownerType: str,
+    ownerId: str,
+    currency: Optional[str] = Query(
+        None, description="Filter by specific currency"
+    ),
+):
+    """
+    Compute balances by replaying MoneyDeltas from the event log.
+    """
+    totals: Dict[str, float] = {}
+
+    if os.path.exists(EVENT_LOG_FILE):
+        with open(EVENT_LOG_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                for outcome in entry.get("outcomes", []):
+                    for md in outcome.get("moneyDeltas", []):
+                        if (
+                            md.get("ownerType") == ownerType
+                            and md.get("ownerId") == ownerId
+                        ):
+                            cur = md.get("currency")
+                            amt = float(md.get("amount", 0))
+                            totals[cur] = totals.get(cur, 0.0) + amt
+
+    balances = [
+        {"currency": cur, "amount": amt} for cur, amt in totals.items()
+    ]
+    if currency:
+        balances = [b for b in balances if b["currency"] == currency]
+
+    return {"balances": balances}
+
+
+@app.get("/api/inventory/{ownerType}/{ownerId}/snapshot")
+def get_inventory_snapshot(ownerType: str, ownerId: str):
+    """
+    Compute current inventory by replaying InventoryDeltas from the event log.
+    """
+    stock: Dict[str, Item] = {}
+
+    if os.path.exists(EVENT_LOG_FILE):
+        with open(EVENT_LOG_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                for outcome in entry.get("outcomes", []):
+                    for invd in outcome.get("inventoryDeltas", []):
+                        if (
+                            invd.get("ownerType") == ownerType
+                            and invd.get("ownerId") == ownerId
+                        ):
+                            op = invd.get("op")
+                            item_data = invd.get("item") or {}
+                            name = item_data.get("name")
+                            if not name:
+                                continue
+
+                            # Normalize into Item
+                            item = stock.get(name) or {
+                                "name": name,
+                                "amount": 0.0,
+                                "value": item_data.get("value"),
+                                "props": item_data.get("props"),
+                            }
+
+                            if op == "add":
+                                item["amount"] = float(
+                                    item.get("amount", 0)
+                                ) + float(item_data.get("amount", 0))
+                            elif op == "remove":
+                                item["amount"] = float(
+                                    item.get("amount", 0)
+                                ) - float(item_data.get("amount", 0))
+                            elif op == "set":
+                                item["amount"] = float(
+                                    item_data.get("amount", 0)
+                                )
+
+                            stock[name] = item
+
+    items = [
+        i for i in stock.values() if float(i.get("amount", 0)) != 0
+    ]
+    return {
+        "ownerType": ownerType,
+        "ownerId": ownerId,
+        "items": items,
     }

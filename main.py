@@ -12,9 +12,9 @@ app = FastAPI(
     title="Life Simulation Backend API",
     version="4.0",
     description=(
-        "Event-first design backend for a custom life simulation game. "
-        "Provides dice, character generation, event logging, players, wallets, inventory, "
-        "and meta endpoints for a dark, narrative-heavy Game Master."
+        "Event-first backend for a dark, mature life-simulation game. "
+        "Provides dice, character generation, event logging, players, wallets, "
+        "inventory, and meta endpoints for a narrative-heavy Game Master."
     ),
 )
 
@@ -84,7 +84,7 @@ class Item(BaseModel):
 class InventoryDelta(BaseModel):
     ownerType: str  # "player" | "npc"
     ownerId: str
-    op: str  # "add" | "remove" | "set"
+    op: str         # "add" | "remove" | "set"
     item: Item
     reason: Optional[str] = None
 
@@ -186,9 +186,6 @@ class LoggedEvent(BaseModel):
     notes: Optional[str] = None
 
 
-# Turn-related models
-
-
 class IntentData(BaseModel):
     summary: str
     data: Optional[Dict[str, Any]] = None
@@ -215,16 +212,55 @@ class ResolveTurnRequest(BaseModel):
     review: Optional[ResolveReviewConfig] = None
 
 
+# Story references models
+
+class StoryReferencesRequest(BaseModel):
+    description: str
+    tags: Optional[List[str]] = None
+
+
+class StoryReferenceItem(BaseModel):
+    theme: str
+    works: List[str]
+
+
+class StoryReferencesResponse(BaseModel):
+    references: List[StoryReferenceItem]
+
+
+# Character generator models
+
+class CharacterRequest(BaseModel):
+    name: str
+    background: Optional[str] = None
+    race: Optional[str] = None
+
+
+class CharacterResponse(BaseModel):
+    name: str
+    background: Optional[str] = None
+    race: Optional[str] = None
+    stats: Dict[str, int]
+    hp: int
+    buffs: List[str] = Field(default_factory=list)
+
+
+class UpdatePlayerRequest(BaseModel):
+    name: Optional[str] = None
+    location: Optional[str] = None
+    stats: Optional[PlayerStats] = None
+    wallets: Optional[List[Balance]] = None
+
+
 # -------------------------------------------------------------------
-# Original state save/load
+# State save/load
 # -------------------------------------------------------------------
 
 
 @app.post("/save_state")
 def save_state(state: dict = Body(...)):
     """
-    Save an arbitrary game state blob. This is not part of the event-first schema,
-    but can be useful as an emergency snapshot.
+    Save an arbitrary game state blob. Useful as an emergency snapshot.
     """
     _write_json(GAME_STATE_FILE, state)
     return {"status": "saved"}
@@ -239,7 +275,7 @@ def load_state():
 
 
 # -------------------------------------------------------------------
-# Dice roller (original)
+# Dice roller
 # -------------------------------------------------------------------
 
 
@@ -285,7 +321,7 @@ def roll_dice(
 
 
 # -------------------------------------------------------------------
-# Character generator (original)
+# Character generator
 # -------------------------------------------------------------------
 
 
@@ -304,21 +340,6 @@ def generate_stats():
         "wisdom": roll_stat(),
         "charisma": roll_stat(),
     }
-
-
-class CharacterRequest(BaseModel):
-    name: str
-    background: Optional[str] = None
-    race: Optional[str] = None
-
-
-class CharacterResponse(BaseModel):
-    name: str
-    background: Optional[str] = None
-    race: Optional[str] = None
-    stats: Dict[str, int]
-    hp: int
-    buffs: List[str] = Field(default_factory=list)
 
 
 @app.post("/create_character", response_model=CharacterResponse)
@@ -365,7 +386,7 @@ def remind_rules():
 
 
 # -------------------------------------------------------------------
-# Relationship advance (original, demo)
+# Relationship advance (demo)
 # -------------------------------------------------------------------
 
 
@@ -410,12 +431,16 @@ def advance_relationship(
 
 
 # -------------------------------------------------------------------
-# /api/meta/instructions – for the GPT to re-read meta rules
+# /api/meta/instructions – canonical GM meta-instructions
 # -------------------------------------------------------------------
 
 
 @app.get("/api/meta/instructions")
 def get_meta_instructions():
+    """
+    Returns meta-instructions for the Game Master.
+    The GPT should use these if it wants a backend copy of its role & tone.
+    """
     return {
         "version": "1.0.0",
         "tone": (
@@ -425,7 +450,7 @@ def get_meta_instructions():
         "instructions": (
             "You are the Game Master of a dark, mature life simulation. "
             "Maintain player autonomy, individual NPCs, and escalating drama. "
-            "Always call precheck and log tools before responding. "
+            'Always call precheck and log tools before responding. '
             "Never break character; only step out of the game when the user "
             "speaks in parentheses."
         ),
@@ -440,11 +465,10 @@ def get_meta_instructions():
 @app.post("/api/gpt-precheck", response_model=PrecheckResult)
 def gpt_precheck(payload: PrecheckRequest):
     """
-    Lightweight implementation: always marks story as advancing and logic as consistent
-    unless you want to embed real checks. GPT should still *treat* this as mandatory.
+    Lightweight implementation: always marks story as advancing and logic as consistent.
+    The GPT should still treat this as a mandatory precheck before it responds.
     """
     summary = payload.latestProposal.summary if payload.latestProposal else ""
-    # You can implement real checks here later.
     return PrecheckResult(
         summary=summary or "No summary provided",
         logicConsistent=True,
@@ -459,20 +483,6 @@ def gpt_precheck(payload: PrecheckRequest):
 # -------------------------------------------------------------------
 # /api/story/references – literary echoes for scene description
 # -------------------------------------------------------------------
-
-
-class StoryReferencesRequest(BaseModel):
-    description: str
-    tags: Optional[List[str]] = None
-
-
-class StoryReferenceItem(BaseModel):
-    theme: str
-    works: List[str]
-
-
-class StoryReferencesResponse(BaseModel):
-    references: List[StoryReferenceItem]
 
 
 @app.post("/api/story/references", response_model=StoryReferencesResponse)
@@ -557,13 +567,6 @@ def get_player(
     return Player(**data)
 
 
-class UpdatePlayerRequest(BaseModel):
-    name: Optional[str] = None
-    location: Optional[str] = None
-    stats: Optional[PlayerStats] = None
-    wallets: Optional[List[Balance]] = None
-
-
 @app.patch("/api/player/{playerId}", response_model=Player)
 def update_player(
     playerId: str,
@@ -598,6 +601,9 @@ def update_player(
 
 @app.post("/api/turns/submit-intent")
 def submit_intent(req: SubmitIntentRequest):
+    """
+    Store the player's declared intent for auditing or offline analysis.
+    """
     record = req.model_dump()
     record["timestamp"] = datetime.utcnow().isoformat() + "Z"
     _append_jsonl(INTENTS_FILE, record)
@@ -622,7 +628,6 @@ def resolve_turn(req: ResolveTurnRequest):
         )
         _append_jsonl(EVENT_LOG_FILE, event.model_dump())
 
-    # Optional: run a precheck-like summary
     return {"status": "applied", "numEvents": len(req.outcomes)}
 
 
@@ -675,8 +680,8 @@ def get_pdf_log(
     ),
 ):
     """
-    Returns metadata for the latest PDF log. You can update PDF_LOG_META_FILE
-    from a separate script that generates the PDF from EVENT_LOG_FILE.
+    Returns metadata for the latest PDF log.
+    You can update PDF_LOG_META_FILE from a separate script that generates the PDF.
     """
     if not os.path.exists(PDF_LOG_META_FILE):
         return {"pdfUrl": None, "generatedAt": None}
@@ -733,7 +738,7 @@ def get_inventory_snapshot(ownerType: str, ownerId: str):
     """
     Compute current inventory by replaying InventoryDeltas from the event log.
     """
-    stock: Dict[str, Item] = {}
+    stock: Dict[str, Dict[str, Any]] = {}
 
     if os.path.exists(EVENT_LOG_FILE):
         with open(EVENT_LOG_FILE, "r", encoding="utf-8") as f:
@@ -754,7 +759,6 @@ def get_inventory_snapshot(ownerType: str, ownerId: str):
                             if not name:
                                 continue
 
-                            # Normalize into Item
                             item = stock.get(name) or {
                                 "name": name,
                                 "amount": 0.0,
@@ -785,3 +789,4 @@ def get_inventory_snapshot(ownerType: str, ownerId: str):
         "ownerId": ownerId,
         "items": items,
     }
+

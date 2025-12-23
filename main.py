@@ -190,25 +190,47 @@ async def resolve_turn(
     summary: str = Body(...),
     detail: str | None = Body(None)
 ):
+    """
+    Logs a new narrative or mechanical event safely, with fully refreshed database session.
+    This version prevents DetachedInstanceError and ensures eventId is available even after commit.
+    """
+
+    # Build header snapshot
     header = now_header()
+
+    # Create the event object
     event = Event(
         playerId=playerId,
         summary=summary,
         detail=detail,
-        worldDate=header["date"],
-        worldTime=header["time"],
-        worldLocation=header["location"],
-        worldFunds=header["funds"],
+        worldDate=header.get("date"),
+        worldTime=header.get("time"),
+        worldLocation=header.get("location"),
+        worldFunds=header.get("funds"),
     )
 
-    with Session(engine) as session:
-    session.add(event)
-    session.commit()
-    session.refresh(event)  # ✅ ensures eventId and other fields are loaded
-    event_id = event.eventId  # ✅ capture before session closes
+    try:
+        # Write to database
+        with Session(engine) as session:
+            session.add(event)
+            session.commit()
+            session.refresh(event)  # ✅ refresh after commit to load eventId
+            event_id = str(event.eventId)
 
-    await append_jsonl(os.path.join(LOG_DIR, "events.jsonl"), event.model_dump())
-    return {"status": "applied", "eventId": event_id}
+        # Also append to JSONL log
+        await append_jsonl(
+            os.path.join(LOG_DIR, "events.jsonl"),
+            event.model_dump()
+        )
+
+        print(f"✅ Event logged successfully: {event_id}")
+        return {"status": "applied", "eventId": event_id}
+
+    except Exception as e:
+        # In case of any failure, log it clearly to console
+        import traceback
+        traceback.print_exc()
+        return {"status": "error", "message": str(e)}
 
 
 

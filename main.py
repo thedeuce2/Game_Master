@@ -14,7 +14,7 @@ import asyncio
 DB_FILE = "life_sim.db"
 LOG_DIR = "static/logs"
 os.makedirs(LOG_DIR, exist_ok=True)
-engine = create_engine(f"sqlite:///{DB_FILE}", echo=False)
+engine = create_engine("sqlite:///life_sim.db")
 
 # =========================================================
 # Models

@@ -202,12 +202,14 @@ async def resolve_turn(
     )
 
     with Session(engine) as session:
-        session.add(event)
-        session.commit()
+    session.add(event)
+    session.commit()
+    session.refresh(event)  # ✅ ensures eventId and other fields are loaded
+    event_id = event.eventId  # ✅ capture before session closes
 
     await append_jsonl(os.path.join(LOG_DIR, "events.jsonl"), event.model_dump())
+    return {"status": "applied", "eventId": event_id}
 
-    return {"status": "applied", "eventId": event.eventId}
 
 
 # =========================================================

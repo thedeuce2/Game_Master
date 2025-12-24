@@ -1,29 +1,22 @@
-# ===========================================================================
-# Life Simulation Backend API v7
-# ---------------------------------------------------------------------------
-# Fully persistent, Render-safe FastAPI backend for your dark, mature life sim.
-# Includes database self-healing, persistent SQLite storage, and fixed /resolve.
-# ===========================================================================
+# =======================================================================
+# Life Simulation Backend API v8
+# -----------------------------------------------------------------------
+# Single-endpoint version.  /api/turns/resolve does everything:
+#   • advances time
+#   • logs the event
+#   • updates the world header
+#   • returns the new scene snapshot
+# =======================================================================
 
 from fastapi import FastAPI, Body
-from sqlmodel import SQLModel, Field, Session, create_engine
-import os, uuid, json, asyncio, datetime, traceback
-import aiofiles
+from sqlmodel import SQLModel, Field, Session, create_engine, select
 from pathlib import Path
+import uuid, os, datetime, json, aiofiles, asyncio, traceback
 
-# -------------------------------------------------------------------
-# App Setup
-# -------------------------------------------------------------------
-
-app = FastAPI(
-    title="Life Simulation Backend API",
-    version="7.0",
-    description="Persistent, self-healing backend for a narrative AI Game Master."
-)
-
-# -------------------------------------------------------------------
-# Persistent Storage Setup
-# -------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# App + persistent paths
+# ----------------------------------------------------------------------
+app = FastAPI(title="Life Simulation Backend API", version="8.0")
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -31,17 +24,21 @@ LOG_DIR = STATIC_DIR / "logs"
 DB_PATH = STATIC_DIR / "life_sim.db"
 
 os.makedirs(LOG_DIR, exist_ok=True)
-
 engine = create_engine(f"sqlite:///{DB_PATH}", echo=False, connect_args={"check_same_thread": False})
 
-# -------------------------------------------------------------------
-# Models
-# -------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# Database models
+# ----------------------------------------------------------------------
+class SceneState(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    date: str
+    time: str
+    location: str
+    funds: str
 
 class Event(SQLModel, table=True):
     eventId: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
     playerId: str | None = None
-    sceneId: str | None = None
     summary: str
     detail: str | None = None
     worldDate: str | None = None
@@ -50,136 +47,120 @@ class Event(SQLModel, table=True):
     worldFunds: str | None = None
     timestamp: str | None = Field(default_factory=lambda: datetime.datetime.utcnow().isoformat() + "Z")
 
+# ----------------------------------------------------------------------
+# Utility helpers
+# ----------------------------------------------------------------------
+def init_scene(session: Session):
+    """Ensure a scene row exists."""
+    scene = session.exec(select(SceneState)).first()
+    if not scene:
+        scene = SceneState(
+            date=datetime.datetime.now().strftime("%B %d, %Y"),
+            time=datetime.datetime.now().strftime("%I:%M %p"),
+            location="Los Angeles, CA",
+            funds="$0"
+        )
+        session.add(scene)
+        session.commit()
+    return scene
 
-# -------------------------------------------------------------------
-# Utilities
-# -------------------------------------------------------------------
+def advance_time(session: Session, hours: int = 3):
+    """Advance in-world time and update stored scene header."""
+    scene = init_scene(session)
+    dt = datetime.datetime.strptime(scene.time, "%I:%M %p")
+    new_dt = (dt + datetime.timedelta(hours=hours))
+    scene.time = new_dt.strftime("%I:%M %p")
+    # Roll to next day if we wrapped around midnight
+    if new_dt.hour < dt.hour:
+        next_day = datetime.datetime.strptime(scene.date, "%B %d, %Y") + datetime.timedelta(days=1)
+        scene.date = next_day.strftime("%B %d, %Y")
+    session.add(scene)
+    session.commit()
+    return scene
 
-def now_header():
-    now = datetime.datetime.now()
-    return {
-        "date": now.strftime("%B %d, %Y"),
-        "time": now.strftime("%I:%M %p"),
-        "location": "Los Angeles, CA",
-        "funds": "$0"
-    }
-
-async def append_jsonl(path: str, obj: dict):
+async def append_jsonl(path: Path, obj: dict):
     async with aiofiles.open(path, "a", encoding="utf-8") as f:
         await f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
-# -------------------------------------------------------------------
-# Startup (self-healing DB)
-# -------------------------------------------------------------------
-
+# ----------------------------------------------------------------------
+# Startup
+# ----------------------------------------------------------------------
 @app.on_event("startup")
 def startup_db():
-    try:
-        os.makedirs(STATIC_DIR, exist_ok=True)
-        os.makedirs(LOG_DIR, exist_ok=True)
-        SQLModel.metadata.create_all(engine)
-        print("✅ Database initialized successfully.")
-    except Exception as e:
-        print(f"❌ Database init error: {e}")
-        traceback.print_exc()
+    os.makedirs(STATIC_DIR, exist_ok=True)
+    os.makedirs(LOG_DIR, exist_ok=True)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        init_scene(session)
+    print("✅ Database ready at", DB_PATH)
 
-# -------------------------------------------------------------------
-# API Endpoints
-# -------------------------------------------------------------------
-
-@app.get("/api/meta/instructions")
-def get_meta_instructions():
-    return {
-        "version": "7.0",
-        "tone": "Dark, grounded, psychological realism.",
-        "instructions": (
-            "You are the Game Master of a dark, mature life simulation. Maintain player autonomy, "
-            "individual NPC motives, and emotional realism. The world continues even when unseen."
-        ),
-    }
-
-
+# ----------------------------------------------------------------------
+# Single orchestrator endpoint
+# ----------------------------------------------------------------------
 @app.post("/api/turns/resolve")
 async def resolve_turn(
     playerId: str = Body(...),
     summary: str = Body(...),
     detail: str | None = Body(None)
 ):
+    """
+    The single entry point.  Each call:
+      1. Advances in-world time.
+      2. Logs the event.
+      3. Returns the updated scene header.
+    """
     try:
-        header = now_header()
-
-        event = Event(
-            playerId=playerId,
-            summary=summary,
-            detail=detail,
-            worldDate=header.get("date"),
-            worldTime=header.get("time"),
-            worldLocation=header.get("location"),
-            worldFunds=header.get("funds"),
-        )
-
         with Session(engine) as session:
+            scene = advance_time(session, hours=3)
+
+            event = Event(
+                playerId=playerId,
+                summary=summary,
+                detail=detail,
+                worldDate=scene.date,
+                worldTime=scene.time,
+                worldLocation=scene.location,
+                worldFunds=scene.funds,
+            )
+
             session.add(event)
             session.commit()
             session.refresh(event)
-            event_id = str(event.eventId)
 
-        event_log_path = LOG_DIR / "events.jsonl"
-        await append_jsonl(str(event_log_path), event.model_dump())
+            await append_jsonl(LOG_DIR / "events.jsonl", event.model_dump())
 
-        print(f"✅ Event logged successfully: {event_id}")
-        return {"status": "applied", "eventId": event_id}
+            print(f"✅ Event logged: {event.eventId}")
+            return {
+                "status": "applied",
+                "eventId": event.eventId,
+                "scene": {
+                    "date": scene.date,
+                    "time": scene.time,
+                    "location": scene.location,
+                    "funds": scene.funds,
+                },
+            }
 
     except Exception as e:
         traceback.print_exc()
-        print(f"❌ Error during resolve_turn: {e}")
         return {"status": "error", "message": str(e)}
 
-
+# ----------------------------------------------------------------------
+# View recent events
+# ----------------------------------------------------------------------
 @app.get("/api/logs/events")
-def get_events(limit: int = 50):
+def get_events(limit: int = 20):
     try:
         with Session(engine) as session:
-            events = session.query(Event).order_by(Event.timestamp.desc()).limit(limit).all()
+            events = session.exec(select(Event).order_by(Event.timestamp.desc()).limit(limit)).all()
             return {"events": [e.model_dump() for e in events]}
     except Exception as e:
         traceback.print_exc()
         return {"events": [], "error": str(e)}
 
-
-@app.get("/api/logs/pdf")
-def get_pdf_log():
-    return {
-        "pdfUrl": None,
-        "generatedAt": datetime.datetime.utcnow().isoformat() + "Z",
-    }
-
-
-# -------------------------------------------------------------------
-# Self-Healing DB Monitor
-# -------------------------------------------------------------------
-
-async def db_watcher():
-    while True:
-        if not DB_PATH.exists():
-            print("⚠️ Database missing — recreating...")
-            try:
-                SQLModel.metadata.create_all(engine)
-                print("✅ Database recreated.")
-            except Exception as e:
-                print(f"❌ Failed to recreate DB: {e}")
-        await asyncio.sleep(300)
-
-
-@app.on_event("startup")
-async def launch_db_watcher():
-    asyncio.create_task(db_watcher())
-
-# -------------------------------------------------------------------
-# Root
-# -------------------------------------------------------------------
-
+# ----------------------------------------------------------------------
+# Root check
+# ----------------------------------------------------------------------
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "Life Simulation Backend v7 running."}
-
+    return {"status": "ok", "message": "Life Simulation Backend v8 running."}

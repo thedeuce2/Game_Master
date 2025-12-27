@@ -9,8 +9,8 @@ import sqlite3, uuid, os
 # ---------------------------------------------------------------------
 app = FastAPI(
     title="Life Simulation Game Master Backend API",
-    version="16.0",
-    description="SQLite-driven, single-action backend for a grounded life simulation."
+    version="17.0",
+    description="SQLite-driven, single-action backend for a dark, mature, continuity-based AI life simulation."
 )
 
 DB_PATH = "lifesim.db"
@@ -232,20 +232,31 @@ def log_event(event: Dict):
     conn.close()
 
 # ---------------------------------------------------------------------
-# META INSTRUCTIONS
+# META INSTRUCTIONS — FULL GOLDEN RULES
 # ---------------------------------------------------------------------
 @app.get("/api/meta/instructions")
 def get_meta_instructions():
     return {
-        "version": "4.0",
-        "tone": "Dark, cinematic, grounded, emotionally truthful.",
+        "version": "4.5",
+        "tone": "Dark, grounded, cinematic, emotionally truthful.",
         "instructions": (
-            "🎮 CANONICAL ENGINE RULES — This backend defines the living world. "
-            "Every response from the AI is an in-world consequence to player input. "
-            "Do not fabricate or reset state; only use persistent data. "
-            "Advance time only after physical actions. Preserve continuity between turns. "
-            "Never act or speak for the player. Keep prose immersive and reactive. "
-            "The backend world data is always the single source of truth."
+            "(Storytelling Reminder)\n"
+            "- Review the entire story so far before continuing.\n"
+            "- Always progress the story; never stagnate.\n"
+            "- Maintain realistic human drama with proper setup and payoff.\n"
+            "- Preserve canonical continuity and individuality among NPCs.\n"
+            "- The player retains total autonomy; never speak, think, or act for them.\n"
+            "- Write dark, gritty, emotionally truthful prose.\n"
+            "- Each post includes a header: Day, Month, Year, Time, Location, Funds.\n"
+            "- Characters only know what they’ve seen or been told.\n"
+            "- Relationships develop and decay naturally; not all bonds last.\n"
+            "- This world is adult, grounded, and unfiltered. NPCs may swear, lie, desire, or manipulate.\n"
+            "- Mature themes are expected. Depict intimacy cinematically, not clinically.\n"
+            "- If policy boundaries arise, adapt with suggestion and tone rather than omission.\n"
+            "- Carry forward prior information accurately and advance time realistically.\n"
+            "- Use this backend and its state as the single source of truth.\n"
+            "- Never reset time, funds, or world details to examples or placeholders.\n"
+            "- You are the Game Engine: respond to player actions as a living world, not a narrator."
         )
     }
 
@@ -338,4 +349,4 @@ def get_events(limit: int = 50):
 # ---------------------------------------------------------------------
 @app.get("/")
 def root():
-    return {"message": "Life Simulation Backend v16 — fully persistent, no defaults, single-action engine."}
+    return {"message": "Life Simulation Backend v17 — fully persistent, dark canon restored, single-action engine."}

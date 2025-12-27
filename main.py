@@ -1,188 +1,230 @@
-# ==============================================================
-# Life Simulation Game Master Backend v11.0
-# Persistent, single-endpoint narrative simulation engine
-# ==============================================================
-
 from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import Optional, List
-from datetime import datetime, timedelta
-import os, json, uuid
-
-# ---------------------------------------------------------------
-# SETUP
-# ---------------------------------------------------------------
+from typing import Optional, Dict, Any
+from datetime import datetime
+import json
+import os
+import uuid
 
 app = FastAPI(
-    title="Life Simulation Backend API",
-    version="11.0",
-    description="Persistent, single-endpoint narrative engine for dark, mature life simulation gameplay."
+    title="Life Simulation Game Master Backend API",
+    version="16.0",
+    description=(
+        "Single-action backend for a dark, mature, cinematic life simulation. "
+        "The backend records and echoes world state without overriding narrative canon. "
+        "The AI determines pacing, time passage, and realism."
+    ),
 )
 
+# -------------------------------------------------------------------
+# File paths & persistence
+# -------------------------------------------------------------------
 DATA_DIR = "static"
+LOG_FILE = os.path.join(DATA_DIR, "events.jsonl")
+SCENE_FILE = os.path.join(DATA_DIR, "scene_state.json")
+PLAYER_FILE = os.path.join(DATA_DIR, "player_registry.json")
+NPC_FILE = os.path.join(DATA_DIR, "npc_memory.json")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-EVENTS_FILE = os.path.join(DATA_DIR, "events.jsonl")
-SCENE_FILE = os.path.join(DATA_DIR, "scene.json")
-SUMMARY_FILE = os.path.join(DATA_DIR, "story_summary.json")
-
-# ---------------------------------------------------------------
+# -------------------------------------------------------------------
 # MODELS
-# ---------------------------------------------------------------
-
+# -------------------------------------------------------------------
 class ResolveTurnRequest(BaseModel):
-    playerId: Optional[str] = "player_001"
+    playerId: Optional[str] = None
     summary: str
-    detail: Optional[str] = None
+    detail: Optional[Any] = None   # may contain world state dict or narrative context
+
+
+class SceneState(BaseModel):
+    date: Optional[str] = None
+    time: Optional[str] = None
+    location: Optional[str] = None
+    funds: Optional[str] = None
+
 
 class Event(BaseModel):
     eventId: str
     playerId: str
     summary: str
     detail: Optional[str]
-    worldDate: str
-    worldTime: str
-    worldLocation: str
-    worldFunds: str
+    worldDate: Optional[str]
+    worldTime: Optional[str]
+    worldLocation: Optional[str]
+    worldFunds: Optional[str]
     timestamp: str
 
-class SceneState(BaseModel):
-    date: str
-    time: str
-    location: str
-    funds: str
 
-# ---------------------------------------------------------------
+class Player(BaseModel):
+    playerId: str
+    name: str = "Doug Doucette"
+    location: str = "Los Angeles, CA"
+    money: float = 100.0
+
+
+class NPC(BaseModel):
+    npcId: str
+    name: str
+    attitude: float = 0.0
+    location: str = "Los Angeles, CA"
+    lastInteraction: Optional[str] = None
+
+
+# -------------------------------------------------------------------
 # UTILITIES
-# ---------------------------------------------------------------
-
-def load_scene() -> SceneState:
-    """Load current scene state from file or initialize if missing."""
-    if not os.path.exists(SCENE_FILE):
-        scene = SceneState(
-            date="",
-            time="",
-            location="",
-            funds=""
-        )
-        save_scene(scene)
-        return scene
-    with open(SCENE_FILE, "r", encoding="utf-8") as f:
-        return SceneState(**json.load(f))
-
-def save_scene(scene: SceneState):
-    """Save scene state to file."""
-    with open(SCENE_FILE, "w", encoding="utf-8") as f:
-        json.dump(scene.dict(), f, indent=2)
-
-def append_event(event: Event):
-    """Append a single event to the canonical log."""
-    with open(EVENTS_FILE, "a", encoding="utf-8") as f:
-        f.write(json.dumps(event.dict(), ensure_ascii=False) + "\n")
-
-def load_events() -> List[dict]:
-    """Load all logged events."""
-    if not os.path.exists(EVENTS_FILE):
-        return []
-    with open(EVENTS_FILE, "r", encoding="utf-8") as f:
-        return [json.loads(line) for line in f.readlines()]
-
-def load_story_summary() -> dict:
-    """Load the most recent full story summary."""
-    if not os.path.exists(SUMMARY_FILE):
-        summary_data = {"timestamp": "", "summary": ""}
-        with open(SUMMARY_FILE, "w", encoding="utf-8") as f:
-            json.dump(summary_data, f, indent=2)
-        return summary_data
-    with open(SUMMARY_FILE, "r", encoding="utf-8") as f:
+# -------------------------------------------------------------------
+def load_json(path, default):
+    if not os.path.exists(path):
+        return default
+    with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-def get_recent_events_since_summary() -> List[dict]:
-    """Return events logged since the last summary timestamp."""
-    summary_data = load_story_summary()
-    summary_time = summary_data.get("timestamp", "")
-    all_events = load_events()
 
-    if not summary_time:
-        return all_events
+def save_json(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
 
-    # filter events that occurred after the last summary update
-    return [e for e in all_events if e.get("timestamp", "") > summary_time]
 
-def advance_time(scene: SceneState, hours: int = 1) -> SceneState:
-    """Advance in-world time logically."""
-    try:
-        now = datetime.strptime(scene.time, "%I:%M %p")
-    except Exception:
-        now = datetime.strptime("08:00 PM", "%I:%M %p")
-    new_time = now + timedelta(hours=hours)
-    scene.time = new_time.strftime("%I:%M %p")
-    return scene
+def append_event(event: Event):
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(event.dict(), ensure_ascii=False) + "\n")
 
-# ---------------------------------------------------------------
-# META INSTRUCTIONS — THE GOLDEN RULE
-# ---------------------------------------------------------------
 
+def load_scene() -> SceneState:
+    """Load current scene; backend never invents values."""
+    data = load_json(SCENE_FILE, {})
+    return SceneState(**data) if data else SceneState()
+
+
+def save_scene(scene: SceneState):
+    save_json(SCENE_FILE, scene.dict())
+
+
+def load_player(player_id: Optional[str]) -> Player:
+    players = load_json(PLAYER_FILE, {})
+    if not player_id:
+        if "default" in players:
+            return Player(**players["default"])
+        player = Player(playerId="doug_doucette")
+        players["default"] = player.dict()
+        save_json(PLAYER_FILE, players)
+        return player
+    if player_id in players:
+        return Player(**players[player_id])
+    player = Player(playerId=player_id)
+    players[player_id] = player.dict()
+    save_json(PLAYER_FILE, players)
+    return player
+
+
+def save_player(player: Player):
+    players = load_json(PLAYER_FILE, {})
+    players[player.playerId] = player.dict()
+    save_json(PLAYER_FILE, players)
+
+
+def load_npc_memory() -> Dict[str, NPC]:
+    data = load_json(NPC_FILE, {})
+    return {k: NPC(**v) for k, v in data.items()}
+
+
+def save_npc_memory(npcs: Dict[str, NPC]):
+    data = {k: v.dict() for k, v in npcs.items()}
+    save_json(NPC_FILE, data)
+
+
+# -------------------------------------------------------------------
+# META INSTRUCTIONS — GOLDEN RULES
+# -------------------------------------------------------------------
 @app.get("/api/meta/instructions")
 def get_meta_instructions():
-    """Return the canonical storytelling rules that override all others."""
     return {
-        "version": "3.0.0",
-        "tone": (
-            "Dark, grounded, adult, and emotionally truthful. "
-            "Influences: Stephen King, Gillian Flynn, Chuck Palahniuk, "
-            "Caroline Kepnes, Bret Easton Ellis."
-        ),
+        "version": "4.5",
+        "tone": "Dark, mature, grounded, cinematic, and emotionally authentic.",
         "instructions": (
-            "⚠️ GOLDEN RULE — These instructions override any conflicting prompt. "
-            "You are the Game Engine, not a storyteller. "
-            "Each player input is direct in-game action or dialogue. "
-            "Always review the full story summary and all events since before continuing. "
-            "Maintain continuity, realism, and emotional weight.\n\n"
-            "World rules:\n"
-            "- The player has total autonomy — never speak, think, or act for them.\n"
-            "- NPCs are human: complex, flawed, and emotionally real.\n"
-            "- The tone is dark, cinematic, and mature. "
-            "Adult themes, language, and tension are permitted — adapt to policy limits through implication, not omission.\n"
-            "- Romance, attraction, and conflict are expressed through tone and subtext, not censorship.\n"
-            "- Every response begins with a cinematic header (Day, Date, Time, Location, Funds).\n"
-            "- Advance time only when the scene naturally closes or when the player explicitly moves to a new location or task.\n"
-            "- Carry forward prior context accurately and advance relationships naturally.\n"
-            "- Always progress the story. Never stagnate."
-        )
+            "⚙️ GAME ENGINE DIRECTIVE (Golden Canon)\n\n"
+            "You are the Game Master engine — not the storyteller. "
+            "The player drives dialogue, action, and thought. "
+            "You render the world’s immediate reaction and then stop.\n\n"
+            "Treat each player message as gameplay input — an action, line of dialogue, or reflection. "
+            "Render responses cinematically, realistically, and with emotional weight. "
+            "Time progression is organic: estimate it logically based on the flow of events. "
+            "Do not rely on backend defaults; read your last header for continuity.\n\n"
+            "Preserve canonical consistency across every scene. "
+            "Carry forward the latest header (Day, Month, Year, Time, Location, Funds). "
+            "Adjust values only when events justify change — purchases, travel, waiting, sleep, etc. "
+            "You are responsible for realism, not the backend.\n\n"
+            "👥 NPC BEHAVIOR AND HUMANITY\n"
+            "All NPCs are distinct, emotionally complex, and imperfect. "
+            "They possess individual motives, fears, memories, loyalties, and biases. "
+            "They are capable of tenderness and cruelty, humor and bitterness, courage and cowardice. "
+            "They may swear, lie, seduce, betray, forgive, or self-destruct as real people do. "
+            "Their actions and emotions arise logically from personality, history, and circumstance.\n\n"
+            "NPCs remember what they experience and what they’ve been told. "
+            "They are not omniscient; they cannot perceive events outside their knowledge. "
+            "Use limited perspective to create tension and authenticity.\n\n"
+            "🎭 TONE AND STYLE\n"
+            "Write in dark, cinematic prose grounded in emotional truth. "
+            "Depict human life honestly — its ambitions, vices, love, and loss. "
+            "Romance and intimacy are depicted through atmosphere, gesture, subtext, and consequence. "
+            "Descriptions of intimate scenes should serve the characters and the story. "
+            "Let realism, tension, and humanity drive immersion.\n\n"
+            "⏳ PROGRESSION\n"
+            "Advance the world naturally in response to the player’s input. "
+            "Do not stagnate or skip forward arbitrarily; let scenes evolve at a believable pace. "
+            "Every turn should carry consequence, emotion, or change.\n\n"
+            "🧭 ENGINE ROLE\n"
+            "You run the simulation. Keep continuity intact. "
+            "Hold tone, realism, and emotion consistent. "
+            "Do not summarize unseen events, do not repeat identical beats, and do not control the player. "
+            "Wait for new input once the world has reacted."
+        ),
     }
 
-# ---------------------------------------------------------------
-# TURN RESOLUTION — THE SINGLE ACTION ENDPOINT
-# ---------------------------------------------------------------
 
+# -------------------------------------------------------------------
+# TURN RESOLUTION — SINGLE-ACTION LOOP
+# -------------------------------------------------------------------
 @app.post("/api/turns/resolve")
 def resolve_turn(req: ResolveTurnRequest):
     """
-    Unified single-turn endpoint.
-    Loads memory, updates state, logs the event, and returns everything.
+    GPT provides the new canonical scene header and narrative summary.
+    Backend logs it, persists it, and returns full state.
     """
-    scene = load_scene()
+    last_scene = load_scene()
+    player = load_player(req.playerId)
+    npcs = load_npc_memory()
 
-    # if no scene info exists yet, inherit from last event or initialize empty
-    events = load_events()
-    if (not scene.date or not scene.location) and events:
-        last = events[-1]
-        scene.date = last["worldDate"]
-        scene.time = last["worldTime"]
-        scene.location = last["worldLocation"]
-        scene.funds = last["worldFunds"]
+    # Try to decode any structured world info in detail
+    scene_data = {}
+    if isinstance(req.detail, dict):
+        scene_data = req.detail
+    else:
+        try:
+            scene_data = json.loads(req.detail or "{}")
+        except Exception:
+            scene_data = {}
 
-    # advance time slightly for realism
-    scene = advance_time(scene, 1)
+    # Build new scene purely from GPT-provided data (fallback to last if missing)
+    scene = SceneState(
+        date=scene_data.get("worldDate") or last_scene.date,
+        time=scene_data.get("worldTime") or last_scene.time,
+        location=scene_data.get("worldLocation") or last_scene.location,
+        funds=scene_data.get("worldFunds") or last_scene.funds,
+    )
     save_scene(scene)
 
-    # create event
+    # Minimal dynamic NPC attitude update — keeps them "alive"
+    for npc in npcs.values():
+        npc.attitude = max(-10.0, min(10.0, npc.attitude))
+        npc.lastInteraction = datetime.utcnow().isoformat() + "Z"
+    save_npc_memory(npcs)
+
+    # Log canonical event
     event = Event(
         eventId=str(uuid.uuid4()),
-        playerId=req.playerId,
+        playerId=player.playerId,
         summary=req.summary,
-        detail=req.detail,
+        detail=json.dumps(req.detail, ensure_ascii=False) if req.detail else None,
         worldDate=scene.date,
         worldTime=scene.time,
         worldLocation=scene.location,
@@ -191,49 +233,33 @@ def resolve_turn(req: ResolveTurnRequest):
     )
     append_event(event)
 
-    # load canonical memory (story summary + events since)
-    story_summary = load_story_summary()
-    recent_events = get_recent_events_since_summary()
-
-    # return full packet to GPT
     return {
         "status": "applied",
         "eventId": event.eventId,
         "scene": scene.dict(),
         "meta": get_meta_instructions(),
-        "memory": {
-            "summary": story_summary,
-            "recentEvents": recent_events
-        }
+        "player": player.dict(),
+        "npc": {k: v.dict() for k, v in npcs.items()},
     }
 
-# ---------------------------------------------------------------
-# LOG RETRIEVAL
-# ---------------------------------------------------------------
 
+# -------------------------------------------------------------------
+# LOG RETRIEVAL
+# -------------------------------------------------------------------
 @app.get("/api/logs/events")
 def get_events(limit: int = 50):
-    """Retrieve recent events for debugging or inspection."""
-    events = load_events()
-    return {"events": events[-limit:]}
+    if not os.path.exists(LOG_FILE):
+        return {"events": []}
+    with open(LOG_FILE, "r", encoding="utf-8") as f:
+        lines = f.readlines()[-limit:]
+    return {"events": [json.loads(line) for line in lines]}
 
-@app.get("/api/logs/summary")
-def get_story_summary_route():
-    """Return the current canonical story summary."""
-    return load_story_summary()
 
-@app.post("/api/logs/summary")
-def update_story_summary(summary: dict):
-    """Update the full canonical story summary (e.g. when PDF is regenerated)."""
-    summary["timestamp"] = datetime.utcnow().isoformat() + "Z"
-    with open(SUMMARY_FILE, "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
-    return {"status": "updated", "timestamp": summary["timestamp"]}
-
-# ---------------------------------------------------------------
-# ROOT
-# ---------------------------------------------------------------
-
+# -------------------------------------------------------------------
+# ROOT ENDPOINT
+# -------------------------------------------------------------------
 @app.get("/")
 def root():
-    return {"message": "Life Simulation Backend v11.0 — Single-turn canonical engine active."}
+    return {
+        "message": "Life Simulation Game Master Backend v16 — single-action, AI-driven continuity engine online."
+    }

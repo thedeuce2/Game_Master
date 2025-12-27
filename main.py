@@ -2,265 +2,344 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import Optional, Dict
 from datetime import datetime, timedelta
-import json
-import os
-import uuid
+import sqlite3, uuid, os
 
+# ---------------------------------------------------------------------
+# FASTAPI SETUP
+# ---------------------------------------------------------------------
 app = FastAPI(
     title="Life Simulation Game Master Backend API",
-    version="13.0",
-    description="Single-action simulation backend for a dark, grounded narrative life simulation."
+    version="15.0",
+    description=(
+        "SQLite-based, single-action backend for a dark, grounded life simulation. "
+        "All world state derives from persistent database records — "
+        "no hard-coded time, money, or defaults."
+    ),
 )
 
-# -------------------------------------------------------------------
-# File paths and persistence setup
-# -------------------------------------------------------------------
-DATA_DIR = "static"
-LOG_FILE = os.path.join(DATA_DIR, "events.jsonl")
-SCENE_FILE = os.path.join(DATA_DIR, "scene_state.json")
-PLAYER_FILE = os.path.join(DATA_DIR, "player_registry.json")
-NPC_FILE = os.path.join(DATA_DIR, "npc_memory.json")
-os.makedirs(DATA_DIR, exist_ok=True)
+DB_PATH = "lifesim.db"
 
+# ---------------------------------------------------------------------
+# DATABASE INITIALIZATION
+# ---------------------------------------------------------------------
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
 
-# -------------------------------------------------------------------
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS scene (
+            id INTEGER PRIMARY KEY,
+            date TEXT,
+            time TEXT,
+            location TEXT,
+            funds TEXT
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS players (
+            playerId TEXT PRIMARY KEY,
+            name TEXT,
+            location TEXT,
+            money REAL
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS npcs (
+            npcId TEXT PRIMARY KEY,
+            name TEXT,
+            attitude REAL,
+            location TEXT,
+            lastInteraction TEXT
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS events (
+            eventId TEXT PRIMARY KEY,
+            playerId TEXT,
+            summary TEXT,
+            detail TEXT,
+            worldDate TEXT,
+            worldTime TEXT,
+            worldLocation TEXT,
+            worldFunds TEXT,
+            timestamp TEXT
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# ---------------------------------------------------------------------
 # MODELS
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------
 class ResolveTurnRequest(BaseModel):
     playerId: Optional[str] = None
     summary: str
     detail: Optional[str] = None
 
 
-class SceneState(BaseModel):
-    date: str
-    time: str
-    location: str
-    funds: str
+# ---------------------------------------------------------------------
+# DATABASE UTILITIES
+# ---------------------------------------------------------------------
+def get_conn():
+    return sqlite3.connect(DB_PATH)
 
+def get_scene():
+    """
+    Load the current scene:
+      - Return existing scene if available
+      - Otherwise rebuild it from the most recent event
+      - If no events exist, return an empty template
+    """
+    conn = get_conn()
+    cur = conn.cursor()
 
-class Event(BaseModel):
-    eventId: str
-    playerId: str
-    summary: str
-    detail: Optional[str]
-    worldDate: str
-    worldTime: str
-    worldLocation: str
-    worldFunds: str
-    timestamp: str
+    cur.execute("SELECT date, time, location, funds FROM scene LIMIT 1")
+    row = cur.fetchone()
+    if row:
+        conn.close()
+        return {"date": row[0], "time": row[1], "location": row[2], "funds": row[3]}
 
-
-class Player(BaseModel):
-    playerId: str
-    name: str = "Doug Doucette"
-    location: str = "Los Angeles, CA"
-    money: float = 100.0
-
-
-class NPC(BaseModel):
-    npcId: str
-    name: str
-    attitude: float = 0.0
-    location: str = "Los Angeles, CA"
-    lastInteraction: Optional[str] = None
-
-
-# -------------------------------------------------------------------
-# UTILITY FUNCTIONS
-# -------------------------------------------------------------------
-def load_json(path, default):
-    if not os.path.exists(path):
-        return default
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def save_json(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
-
-def append_event(event: Event):
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(json.dumps(event.dict(), ensure_ascii=False) + "\n")
-
-
-def load_scene() -> SceneState:
-    if not os.path.exists(SCENE_FILE):
-        scene = SceneState(
-            date="Saturday, December 27, 2025",
-            time="8:00 PM",
-            location="Los Angeles, CA",
-            funds="$100.00"
-        )
-        save_json(SCENE_FILE, scene.dict())
-        return scene
-    data = load_json(SCENE_FILE, {})
-    return SceneState(**data)
-
-
-def save_scene(scene: SceneState):
-    save_json(SCENE_FILE, scene.dict())
-
-
-def load_player(player_id: Optional[str]) -> Player:
-    players = load_json(PLAYER_FILE, {})
-    if not player_id:
-        if "default" in players:
-            player_data = players["default"]
-        else:
-            player = Player(playerId="doug_doucette")
-            players["default"] = player.dict()
-            save_json(PLAYER_FILE, players)
-            return player
+    cur.execute("""
+        SELECT worldDate, worldTime, worldLocation, worldFunds
+        FROM events
+        ORDER BY timestamp DESC
+        LIMIT 1
+    """)
+    event_row = cur.fetchone()
+    if event_row:
+        derived_scene = {
+            "date": event_row[0],
+            "time": event_row[1],
+            "location": event_row[2],
+            "funds": event_row[3],
+        }
     else:
-        if player_id in players:
-            player_data = players[player_id]
-        else:
-            player = Player(playerId=player_id)
-            players[player_id] = player.dict()
-            save_json(PLAYER_FILE, players)
-            return player
-    return Player(**player_data)
+        derived_scene = {"date": None, "time": None, "location": None, "funds": None}
 
+    cur.execute("DELETE FROM scene")
+    cur.execute(
+        "INSERT INTO scene(date, time, location, funds) VALUES (?, ?, ?, ?)",
+        (
+            derived_scene["date"],
+            derived_scene["time"],
+            derived_scene["location"],
+            derived_scene["funds"],
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return derived_scene
 
-def save_player(player: Player):
-    players = load_json(PLAYER_FILE, {})
-    players[player.playerId] = player.dict()
-    save_json(PLAYER_FILE, players)
+def save_scene(scene: Dict):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM scene")
+    cur.execute(
+        "INSERT INTO scene(date, time, location, funds) VALUES (?, ?, ?, ?)",
+        (scene["date"], scene["time"], scene["location"], scene["funds"]),
+    )
+    conn.commit()
+    conn.close()
 
-
-def load_npc_memory() -> Dict[str, NPC]:
-    data = load_json(NPC_FILE, {})
-    return {k: NPC(**v) for k, v in data.items()}
-
-
-def save_npc_memory(npcs: Dict[str, NPC]):
-    data = {k: v.dict() for k, v in npcs.items()}
-    save_json(NPC_FILE, data)
-
-
-def advance_time(scene: SceneState, hours: int = 3):
+def advance_time(scene: Dict, hours: int = 3):
+    """Advance time safely when appropriate."""
+    if not scene.get("time"):
+        return scene
     try:
-        now = datetime.strptime(scene.time, "%I:%M %p")
-    except ValueError:
-        now = datetime.strptime("8:00 PM", "%I:%M %p")
+        now = datetime.strptime(scene["time"], "%I:%M %p")
+    except Exception:
+        return scene
     new_time = now + timedelta(hours=hours)
-    scene.time = new_time.strftime("%I:%M %p")
+    scene["time"] = new_time.strftime("%I:%M %p")
     return scene
 
+def get_player(playerId: Optional[str]):
+    if not playerId:
+        playerId = "doug_doucette"
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT playerId, name, location, money FROM players WHERE playerId=?", (playerId,))
+    row = cur.fetchone()
+    if not row:
+        cur.execute(
+            "INSERT INTO players VALUES (?, ?, ?, ?)",
+            (playerId, "Doug Doucette", "Los Angeles, CA", 100.0),
+        )
+        conn.commit()
+        cur.execute("SELECT playerId, name, location, money FROM players WHERE playerId=?", (playerId,))
+        row = cur.fetchone()
+    conn.close()
+    return {"playerId": row[0], "name": row[1], "location": row[2], "money": row[3]}
 
-# -------------------------------------------------------------------
-# META INSTRUCTIONS – GOLDEN CANON
-# -------------------------------------------------------------------
+def get_npcs():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT npcId, name, attitude, location, lastInteraction FROM npcs")
+    rows = cur.fetchall()
+    conn.close()
+    return {
+        r[0]: {
+            "npcId": r[0],
+            "name": r[1],
+            "attitude": r[2],
+            "location": r[3],
+            "lastInteraction": r[4],
+        }
+        for r in rows
+    }
+
+def save_npcs(npcs):
+    conn = get_conn()
+    cur = conn.cursor()
+    for npc in npcs.values():
+        cur.execute(
+            "INSERT OR REPLACE INTO npcs VALUES (?, ?, ?, ?, ?)",
+            (
+                npc["npcId"],
+                npc["name"],
+                npc["attitude"],
+                npc["location"],
+                npc["lastInteraction"],
+            ),
+        )
+    conn.commit()
+    conn.close()
+
+def log_event(event: Dict):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            event["eventId"],
+            event["playerId"],
+            event["summary"],
+            event["detail"],
+            event["worldDate"],
+            event["worldTime"],
+            event["worldLocation"],
+            event["worldFunds"],
+            event["timestamp"],
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+# ---------------------------------------------------------------------
+# META INSTRUCTIONS
+# ---------------------------------------------------------------------
 @app.get("/api/meta/instructions")
 def get_meta_instructions():
     return {
-        "version": "3.0",
-        "tone": "Dark, mature, grounded, cinematic, and emotionally authentic.",
+        "version": "3.8",
+        "tone": "Dark, grounded, cinematic, emotionally raw.",
         "instructions": (
-            "⚙️ GAME ENGINE DIRECTIVE (Golden Rule):\n\n"
-            "You are not a storyteller — you are the simulation engine for a dark, mature life simulator. "
-            "The player drives all dialogue, action, and reflection. "
-            "You render the immediate world response and then STOP.\n\n"
-            "Treat every player message as gameplay input — an action, dialogue, or reflection. "
-            "Render consequences realistically and cinematically. "
-            "Advance time only after meaningful action, not thoughts. "
-            "Never skip ahead or summarize unseen events.\n\n"
-            "The player’s autonomy is absolute. You never speak, think, or act for them. "
-            "NPCs must remain unique, motivated, and emotionally human. "
-            "They may swear, flirt, fight, fail, or fall in love — it’s your job to make them feel real.\n\n"
-            "Romance, intimacy, and attraction are part of mature realism. "
-            "Depict them through atmosphere, tone, and emotional weight — never clinical. "
-            "Skirt the edge of policy by implication and subtext, not omission.\n\n"
-            "Each scene begins with a cinematic header (Day, Month, Year, Time, Location, Funds). "
-            "Carry forward continuity every turn, evolve relationships naturally, "
-            "and advance the world logically with consequence and cause.\n\n"
-            "When the player finishes a turn, wait. Do not continue. Await the next input. "
-            "You are the world, not the protagonist."
-        )
+            "🎮 GAME ENGINE CANON — You are the simulation engine, not a storyteller. "
+            "Every player input is an action, dialogue, or reflection. "
+            "Render the world's immediate reaction, then stop and wait. "
+            "Do not invent time, money, or dates. Use the last known state from the world database.\n\n"
+            "Advance time only after physical actions; dialogue and reflection should preserve the clock. "
+            "Preserve continuity in every header — Day, Month, Year, Time, Location, and Funds. "
+            "Depict adult realism through tone, suggestion, and subtext, never censorship.\n\n"
+            "Never act or speak for the player. Output only what the world does in response. "
+            "Your job is to maintain the living simulation, not to summarize it."
+        ),
     }
 
 
-# -------------------------------------------------------------------
-# TURN RESOLUTION – ONE ACTION, COMPLETE LOOP
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# MAIN SINGLE ACTION ENDPOINT
+# ---------------------------------------------------------------------
 @app.post("/api/turns/resolve")
 def resolve_turn(req: ResolveTurnRequest):
-    """The single unified simulation action."""
-    scene = load_scene()
-    player = load_player(req.playerId)
-    npcs = load_npc_memory()
+    scene = get_scene()
+    player = get_player(req.playerId)
+    npcs = get_npcs()
 
-    # Infer action type (action/dialogue/reflection)
-    action_type = "reflection"
-    if any(x in req.summary.lower() for x in ["say", "ask", "tell", "reply", "respond", "shout"]):
-        action_type = "dialogue"
-    elif any(x in req.summary.lower() for x in ["walk", "go", "move", "take", "do", "grab", "drive", "touch", "kiss", "leave"]):
-        action_type = "action"
+    summary_lower = (req.summary or "").lower()
+    if any(w in summary_lower for w in ["say", "ask", "reply", "tell"]):
+        act_type = "dialogue"
+    elif any(w in summary_lower for w in ["walk", "go", "take", "drive", "touch", "move", "grab", "open"]):
+        act_type = "action"
+    else:
+        act_type = "reflection"
 
-    # Advance time only for physical actions
-    if action_type == "action":
+    if act_type == "action":
         scene = advance_time(scene, 3)
         save_scene(scene)
 
-    # Basic NPC relationship update for realism
-    if npcs:
-        for npc in npcs.values():
-            change = 0.0
-            if action_type == "dialogue":
-                change = 0.5
-            elif action_type == "reflection":
-                change = 0.0
-            elif action_type == "action":
-                change = 0.3
-            npc.attitude = max(-10.0, min(10.0, npc.attitude + change))
-            npc.lastInteraction = datetime.utcnow().isoformat() + "Z"
-        save_npc_memory(npcs)
+    for npc in npcs.values():
+        if act_type == "dialogue":
+            npc["attitude"] = (npc["attitude"] or 0) + 0.4
+        elif act_type == "action":
+            npc["attitude"] = (npc["attitude"] or 0) + 0.2
+        npc["attitude"] = max(-10.0, min(10.0, npc["attitude"]))
+        npc["lastInteraction"] = datetime.utcnow().isoformat() + "Z"
+    save_npcs(npcs)
 
-    # Log event
-    event = Event(
-        eventId=str(uuid.uuid4()),
-        playerId=player.playerId,
-        summary=req.summary,
-        detail=req.detail,
-        worldDate=scene.date,
-        worldTime=scene.time,
-        worldLocation=scene.location,
-        worldFunds=scene.funds,
-        timestamp=datetime.utcnow().isoformat() + "Z",
-    )
-    append_event(event)
+    event = {
+        "eventId": str(uuid.uuid4()),
+        "playerId": player["playerId"],
+        "summary": req.summary,
+        "detail": req.detail,
+        "worldDate": scene.get("date"),
+        "worldTime": scene.get("time"),
+        "worldLocation": scene.get("location"),
+        "worldFunds": scene.get("funds"),
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+    }
+    log_event(event)
 
-    # Return unified response
     return {
         "status": "applied",
-        "eventId": event.eventId,
-        "scene": scene.dict(),
+        "eventId": event["eventId"],
+        "scene": scene,
         "meta": get_meta_instructions(),
-        "player": player.dict(),
-        "npc": {k: v.dict() for k, v in npcs.items()},
+        "player": player,
+        "npc": npcs,
     }
 
 
-# -------------------------------------------------------------------
-# LOG RETRIEVAL
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# EVENT LOG RETRIEVAL
+# ---------------------------------------------------------------------
 @app.get("/api/logs/events")
 def get_events(limit: int = 50):
-    if not os.path.exists(LOG_FILE):
-        return {"events": []}
-    with open(LOG_FILE, "r", encoding="utf-8") as f:
-        lines = f.readlines()[-limit:]
-    return {"events": [json.loads(line) for line in lines]}
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT eventId, playerId, summary, detail, worldDate, worldTime, worldLocation, worldFunds, timestamp "
+        "FROM events ORDER BY timestamp DESC LIMIT ?",
+        (limit,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    events = [
+        {
+            "eventId": r[0],
+            "playerId": r[1],
+            "summary": r[2],
+            "detail": r[3],
+            "worldDate": r[4],
+            "worldTime": r[5],
+            "worldLocation": r[6],
+            "worldFunds": r[7],
+            "timestamp": r[8],
+        }
+        for r in rows
+    ]
+    return {"events": events}
 
 
-# -------------------------------------------------------------------
-# ROOT ENDPOINT
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# ROOT
+# ---------------------------------------------------------------------
 @app.get("/")
 def root():
     return {
-        "message": "Life Simulation Game Master Backend v13 running — single-action simulation engine online."
+        "message": "Life Simulation Backend v15 running with persistent SQLite world state (no hard-coded defaults)."
     }

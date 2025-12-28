@@ -8,16 +8,12 @@ import uuid
 
 app = FastAPI(
     title="Life Simulation Game Master Backend API",
-    version="16.0",
-    description=(
-        "Single-action backend for a dark, mature, cinematic life simulation. "
-        "The backend records and echoes world state without overriding narrative canon. "
-        "The AI determines pacing, time passage, and realism."
-    ),
+    version="18.0",
+    description="Backend for dark, grounded life simulation with persistent world continuity."
 )
 
 # -------------------------------------------------------------------
-# File paths & persistence
+# FILE PATHS
 # -------------------------------------------------------------------
 DATA_DIR = "static"
 LOG_FILE = os.path.join(DATA_DIR, "events.jsonl")
@@ -32,7 +28,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 class ResolveTurnRequest(BaseModel):
     playerId: Optional[str] = None
     summary: str
-    detail: Optional[Any] = None   # may contain world state dict or narrative context
+    detail: Optional[Any] = None
 
 
 class SceneState(BaseModel):
@@ -90,12 +86,15 @@ def append_event(event: Event):
 
 
 def load_scene() -> SceneState:
-    """Load current scene; backend never invents values."""
+    """Load the last known scene state. Never invent or reset values."""
     data = load_json(SCENE_FILE, {})
-    return SceneState(**data) if data else SceneState()
+    if not data:
+        return SceneState()
+    return SceneState(**data)
 
 
 def save_scene(scene: SceneState):
+    """Persist the current scene state to disk."""
     save_json(SCENE_FILE, scene.dict())
 
 
@@ -133,7 +132,7 @@ def save_npc_memory(npcs: Dict[str, NPC]):
 
 
 # -------------------------------------------------------------------
-# META INSTRUCTIONS — GOLDEN RULES
+# META INSTRUCTIONS — GOLDEN RULES (EXACTLY AS PROVIDED)
 # -------------------------------------------------------------------
 @app.get("/api/meta/instructions")
 def get_meta_instructions():
@@ -182,19 +181,16 @@ def get_meta_instructions():
 
 
 # -------------------------------------------------------------------
-# TURN RESOLUTION — SINGLE-ACTION LOOP
+# TURN RESOLUTION — FIXED HEADER MERGE
 # -------------------------------------------------------------------
 @app.post("/api/turns/resolve")
 def resolve_turn(req: ResolveTurnRequest):
-    """
-    GPT provides the new canonical scene header and narrative summary.
-    Backend logs it, persists it, and returns full state.
-    """
+    """Merge GPT-provided data with stored state, preserving header continuity."""
     last_scene = load_scene()
     player = load_player(req.playerId)
     npcs = load_npc_memory()
 
-    # Try to decode any structured world info in detail
+    # Parse structured world data if present
     scene_data = {}
     if isinstance(req.detail, dict):
         scene_data = req.detail
@@ -204,18 +200,23 @@ def resolve_turn(req: ResolveTurnRequest):
         except Exception:
             scene_data = {}
 
-    # Build new scene purely from GPT-provided data (fallback to last if missing)
-    scene = SceneState(
+    # --- HEADER FIX ---
+    # Merge GPT updates with stored scene, never overwrite with null or reset values
+    merged_scene = SceneState(
         date=scene_data.get("worldDate") or last_scene.date,
         time=scene_data.get("worldTime") or last_scene.time,
         location=scene_data.get("worldLocation") or last_scene.location,
         funds=scene_data.get("worldFunds") or last_scene.funds,
     )
-    save_scene(scene)
 
-    # Minimal dynamic NPC attitude update — keeps them "alive"
+    # Guarantee a valid header — if empty, use last stored header
+    if not any([merged_scene.date, merged_scene.time, merged_scene.location, merged_scene.funds]):
+        merged_scene = last_scene
+
+    save_scene(merged_scene)
+
+    # Update minimal NPC data (keeps them alive without overwriting attitude)
     for npc in npcs.values():
-        npc.attitude = max(-10.0, min(10.0, npc.attitude))
         npc.lastInteraction = datetime.utcnow().isoformat() + "Z"
     save_npc_memory(npcs)
 
@@ -225,10 +226,10 @@ def resolve_turn(req: ResolveTurnRequest):
         playerId=player.playerId,
         summary=req.summary,
         detail=json.dumps(req.detail, ensure_ascii=False) if req.detail else None,
-        worldDate=scene.date,
-        worldTime=scene.time,
-        worldLocation=scene.location,
-        worldFunds=scene.funds,
+        worldDate=merged_scene.date,
+        worldTime=merged_scene.time,
+        worldLocation=merged_scene.location,
+        worldFunds=merged_scene.funds,
         timestamp=datetime.utcnow().isoformat() + "Z",
     )
     append_event(event)
@@ -236,7 +237,7 @@ def resolve_turn(req: ResolveTurnRequest):
     return {
         "status": "applied",
         "eventId": event.eventId,
-        "scene": scene.dict(),
+        "scene": merged_scene.dict(),
         "meta": get_meta_instructions(),
         "player": player.dict(),
         "npc": {k: v.dict() for k, v in npcs.items()},
@@ -256,10 +257,8 @@ def get_events(limit: int = 50):
 
 
 # -------------------------------------------------------------------
-# ROOT ENDPOINT
+# ROOT
 # -------------------------------------------------------------------
 @app.get("/")
 def root():
-    return {
-        "message": "Life Simulation Game Master Backend v16 — single-action, AI-driven continuity engine online."
-    }
+    return {"message": "Life Simulation Game Master Backend v18 — header continuity stable."}

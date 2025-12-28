@@ -8,15 +8,16 @@ import uuid
 
 app = FastAPI(
     title="Life Simulation Game Master Backend API",
-    version="15.0",
+    version="FINAL-WORLD-AGNOSTIC",
     description=(
-        "Minimal, AI-authoritative backend for a narrative life simulation. "
-        "This server records and returns the exact world state provided by the Game Master."
+        "Authoritative backend for narrative simulations. "
+        "No defaults, no safety fallbacks, no story assumptions — "
+        "it only records and returns exactly what the AI sends."
     ),
 )
 
 # -------------------------------------------------------------------
-# Storage paths
+# File paths
 # -------------------------------------------------------------------
 DATA_DIR = "static"
 LOG_FILE = os.path.join(DATA_DIR, "events.jsonl")
@@ -31,7 +32,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 class ResolveTurnRequest(BaseModel):
     playerId: Optional[str] = None
     summary: str
-    detail: Optional[Any] = None   # may contain header dict or other data
+    detail: Optional[Any] = None
 
 
 class SceneState(BaseModel):
@@ -55,16 +56,16 @@ class Event(BaseModel):
 
 class Player(BaseModel):
     playerId: str
-    name: str = "Doug Doucette"
-    location: str = "Los Angeles, CA"
-    money: float = 100.0
+    name: Optional[str] = None
+    location: Optional[str] = None
+    money: Optional[float] = None
 
 
 class NPC(BaseModel):
     npcId: str
     name: str
     attitude: float = 0.0
-    location: str = "Los Angeles, CA"
+    location: Optional[str] = None
     lastInteraction: Optional[str] = None
 
 
@@ -77,30 +78,30 @@ def load_json(path, default):
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
+
 def save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+
 
 def append_event(event: Event):
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(event.dict(), ensure_ascii=False) + "\n")
 
+
 def load_scene() -> SceneState:
     data = load_json(SCENE_FILE, {})
-    return SceneState(**data) if data else SceneState()
+    return SceneState(**data)
+
 
 def save_scene(scene: SceneState):
     save_json(SCENE_FILE, scene.dict())
 
+
 def load_player(player_id: Optional[str]) -> Player:
     players = load_json(PLAYER_FILE, {})
     if not player_id:
-        if "default" in players:
-            return Player(**players["default"])
-        player = Player(playerId="doug_doucette")
-        players["default"] = player.dict()
-        save_json(PLAYER_FILE, players)
-        return player
+        player_id = "default_player"
     if player_id in players:
         return Player(**players[player_id])
     player = Player(playerId=player_id)
@@ -108,21 +109,25 @@ def load_player(player_id: Optional[str]) -> Player:
     save_json(PLAYER_FILE, players)
     return player
 
+
 def save_player(player: Player):
     players = load_json(PLAYER_FILE, {})
     players[player.playerId] = player.dict()
     save_json(PLAYER_FILE, players)
 
+
 def load_npc_memory() -> Dict[str, NPC]:
     data = load_json(NPC_FILE, {})
     return {k: NPC(**v) for k, v in data.items()}
+
 
 def save_npc_memory(npcs: Dict[str, NPC]):
     data = {k: v.dict() for k, v in npcs.items()}
     save_json(NPC_FILE, data)
 
+
 # -------------------------------------------------------------------
-# META INSTRUCTIONS — kept exactly as supplied
+# META INSTRUCTIONS — UNEDITED
 # -------------------------------------------------------------------
 @app.get("/api/meta/instructions")
 def get_meta_instructions():
@@ -169,16 +174,17 @@ def get_meta_instructions():
         ),
     }
 
+
 # -------------------------------------------------------------------
-# TURN RESOLUTION — pure record mode
+# TURN RESOLUTION — PURE AUTHORITATIVE MODE
 # -------------------------------------------------------------------
 @app.post("/api/turns/resolve")
 def resolve_turn(req: ResolveTurnRequest):
-    """Store and echo exactly what the Game Master sends."""
+    """Record exactly what the AI sends. No defaults, no interference."""
     player = load_player(req.playerId)
     npcs = load_npc_memory()
+    last_scene = load_scene()
 
-    # try to parse provided scene info
     scene_data = {}
     if isinstance(req.detail, dict):
         scene_data = req.detail
@@ -188,18 +194,22 @@ def resolve_turn(req: ResolveTurnRequest):
         except Exception:
             scene_data = {}
 
-    scene = SceneState(
-        date=scene_data.get("worldDate"),
-        time=scene_data.get("worldTime"),
-        location=scene_data.get("worldLocation"),
-        funds=scene_data.get("worldFunds"),
-    )
+    # Only update keys that exist and have non-null values
+    updated_scene = last_scene.dict()
+    for key in ["date", "time", "location", "funds"]:
+        api_key = f"world{key.capitalize()}"
+        if api_key in scene_data and scene_data[api_key] not in [None, ""]:
+            updated_scene[key] = scene_data[api_key]
+
+    scene = SceneState(**updated_scene)
     save_scene(scene)
 
+    # Update NPC timestamps only
     for npc in npcs.values():
         npc.lastInteraction = datetime.utcnow().isoformat() + "Z"
     save_npc_memory(npcs)
 
+    # Log exactly what was received
     event = Event(
         eventId=str(uuid.uuid4()),
         playerId=player.playerId,
@@ -222,6 +232,7 @@ def resolve_turn(req: ResolveTurnRequest):
         "npc": {k: v.dict() for k, v in npcs.items()},
     }
 
+
 # -------------------------------------------------------------------
 # LOG RETRIEVAL
 # -------------------------------------------------------------------
@@ -233,11 +244,10 @@ def get_events(limit: int = 50):
         lines = f.readlines()[-limit:]
     return {"events": [json.loads(line) for line in lines]}
 
+
 # -------------------------------------------------------------------
 # ROOT
 # -------------------------------------------------------------------
 @app.get("/")
 def root():
-    return {
-        "message": "Life Simulation Game Master Backend v15 — AI-authoritative recorder active."
-    }
+    return {"message": "Life Simulation Backend — Pure Authoritative, World-Agnostic Mode Online."}

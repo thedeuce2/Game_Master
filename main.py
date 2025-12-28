@@ -1,30 +1,27 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import Optional, Dict, Any
+from typing import Optional, Any
 from datetime import datetime
-import json
-import os
-import uuid
+import json, os, uuid
 
 app = FastAPI(
     title="Life Simulation Game Master Backend API",
-    version="FINAL-WORLD-AGNOSTIC",
+    version="15.1",
     description=(
-        "Authoritative backend for narrative simulations. "
-        "No defaults, no safety fallbacks, no story assumptions — "
-        "it only records and returns exactly what the AI sends."
+        "Backend designed for a dark, mature life simulation. "
+        "The GPT engine owns and maintains the narrative header (date, time, location, funds). "
+        "The backend never touches, stores, or generates header data. "
+        "It only records gameplay turns, ensuring full player and AI narrative autonomy."
     ),
 )
 
 # -------------------------------------------------------------------
-# File paths
+# File setup
 # -------------------------------------------------------------------
 DATA_DIR = "static"
 LOG_FILE = os.path.join(DATA_DIR, "events.jsonl")
-SCENE_FILE = os.path.join(DATA_DIR, "scene_state.json")
-PLAYER_FILE = os.path.join(DATA_DIR, "player_registry.json")
-NPC_FILE = os.path.join(DATA_DIR, "npc_memory.json")
 os.makedirs(DATA_DIR, exist_ok=True)
+
 
 # -------------------------------------------------------------------
 # MODELS
@@ -35,99 +32,17 @@ class ResolveTurnRequest(BaseModel):
     detail: Optional[Any] = None
 
 
-class SceneState(BaseModel):
-    date: Optional[str] = None
-    time: Optional[str] = None
-    location: Optional[str] = None
-    funds: Optional[str] = None
-
-
-class Event(BaseModel):
-    eventId: str
-    playerId: str
-    summary: str
-    detail: Optional[str]
-    worldDate: Optional[str]
-    worldTime: Optional[str]
-    worldLocation: Optional[str]
-    worldFunds: Optional[str]
-    timestamp: str
-
-
-class Player(BaseModel):
-    playerId: str
-    name: Optional[str] = None
-    location: Optional[str] = None
-    money: Optional[float] = None
-
-
-class NPC(BaseModel):
-    npcId: str
-    name: str
-    attitude: float = 0.0
-    location: Optional[str] = None
-    lastInteraction: Optional[str] = None
-
-
 # -------------------------------------------------------------------
 # UTILITIES
 # -------------------------------------------------------------------
-def load_json(path, default):
-    if not os.path.exists(path):
-        return default
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def save_json(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
-
-def append_event(event: Event):
+def append_event(event: dict):
+    """Logs events exactly as received, without altering or supplementing data."""
     with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(json.dumps(event.dict(), ensure_ascii=False) + "\n")
-
-
-def load_scene() -> SceneState:
-    data = load_json(SCENE_FILE, {})
-    return SceneState(**data)
-
-
-def save_scene(scene: SceneState):
-    save_json(SCENE_FILE, scene.dict())
-
-
-def load_player(player_id: Optional[str]) -> Player:
-    players = load_json(PLAYER_FILE, {})
-    if not player_id:
-        player_id = "default_player"
-    if player_id in players:
-        return Player(**players[player_id])
-    player = Player(playerId=player_id)
-    players[player_id] = player.dict()
-    save_json(PLAYER_FILE, players)
-    return player
-
-
-def save_player(player: Player):
-    players = load_json(PLAYER_FILE, {})
-    players[player.playerId] = player.dict()
-    save_json(PLAYER_FILE, players)
-
-
-def load_npc_memory() -> Dict[str, NPC]:
-    data = load_json(NPC_FILE, {})
-    return {k: NPC(**v) for k, v in data.items()}
-
-
-def save_npc_memory(npcs: Dict[str, NPC]):
-    data = {k: v.dict() for k, v in npcs.items()}
-    save_json(NPC_FILE, data)
+        f.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 
 # -------------------------------------------------------------------
-# META INSTRUCTIONS — UNEDITED
+# META INSTRUCTIONS — GOLDEN CANON (Unchanged)
 # -------------------------------------------------------------------
 @app.get("/api/meta/instructions")
 def get_meta_instructions():
@@ -141,12 +56,10 @@ def get_meta_instructions():
             "You render the world’s immediate reaction and then stop.\n\n"
             "Treat each player message as gameplay input — an action, line of dialogue, or reflection. "
             "Render responses cinematically, realistically, and with emotional weight. "
-            "Time progression is organic: estimate it logically based on the flow of events. "
-            "Do not rely on backend defaults; read your last header for continuity.\n\n"
+            "Time progression is organic and determined by narrative flow — not backend logic.\n\n"
             "Preserve canonical consistency across every scene. "
-            "Carry forward the latest header (Day, Month, Year, Time, Location, Funds). "
-            "Adjust values only when events justify change — purchases, travel, waiting, sleep, etc. "
-            "You are responsible for realism, not the backend.\n\n"
+            "Carry forward the latest header (Day, Month, Year, Time, Location, Funds) entirely within your own logic. "
+            "The backend does not track, fix, or overwrite headers — that is your job.\n\n"
             "👥 NPC BEHAVIOR AND HUMANITY\n"
             "All NPCs are distinct, emotionally complex, and imperfect. "
             "They possess individual motives, fears, memories, loyalties, and biases. "
@@ -176,61 +89,25 @@ def get_meta_instructions():
 
 
 # -------------------------------------------------------------------
-# TURN RESOLUTION — PURE AUTHORITATIVE MODE
+# TURN RESOLUTION — HEADER-AGNOSTIC
 # -------------------------------------------------------------------
 @app.post("/api/turns/resolve")
 def resolve_turn(req: ResolveTurnRequest):
-    """Record exactly what the AI sends. No defaults, no interference."""
-    player = load_player(req.playerId)
-    npcs = load_npc_memory()
-    last_scene = load_scene()
-
-    scene_data = {}
-    if isinstance(req.detail, dict):
-        scene_data = req.detail
-    else:
-        try:
-            scene_data = json.loads(req.detail or "{}")
-        except Exception:
-            scene_data = {}
-
-    # Only update keys that exist and have non-null values
-    updated_scene = last_scene.dict()
-    for key in ["date", "time", "location", "funds"]:
-        api_key = f"world{key.capitalize()}"
-        if api_key in scene_data and scene_data[api_key] not in [None, ""]:
-            updated_scene[key] = scene_data[api_key]
-
-    scene = SceneState(**updated_scene)
-    save_scene(scene)
-
-    # Update NPC timestamps only
-    for npc in npcs.values():
-        npc.lastInteraction = datetime.utcnow().isoformat() + "Z"
-    save_npc_memory(npcs)
-
-    # Log exactly what was received
-    event = Event(
-        eventId=str(uuid.uuid4()),
-        playerId=player.playerId,
-        summary=req.summary,
-        detail=json.dumps(req.detail, ensure_ascii=False) if req.detail else None,
-        worldDate=scene.date,
-        worldTime=scene.time,
-        worldLocation=scene.location,
-        worldFunds=scene.funds,
-        timestamp=datetime.utcnow().isoformat() + "Z",
-    )
-    append_event(event)
-
-    return {
-        "status": "applied",
-        "eventId": event.eventId,
-        "scene": scene.dict(),
-        "meta": get_meta_instructions(),
-        "player": player.dict(),
-        "npc": {k: v.dict() for k, v in npcs.items()},
+    """
+    Logs gameplay turns exactly as received.
+    Does NOT record or reference any header information.
+    The GPT engine is fully responsible for continuity.
+    """
+    event = {
+        "eventId": str(uuid.uuid4()),
+        "playerId": req.playerId or "player_default",
+        "summary": req.summary,
+        "detail": req.detail,
+        "timestamp": datetime.utcnow().isoformat() + "Z"
     }
+
+    append_event(event)
+    return {"status": "applied", "eventId": event["eventId"], "meta": get_meta_instructions()}
 
 
 # -------------------------------------------------------------------
@@ -250,4 +127,4 @@ def get_events(limit: int = 50):
 # -------------------------------------------------------------------
 @app.get("/")
 def root():
-    return {"message": "Life Simulation Backend — Pure Authoritative, World-Agnostic Mode Online."}
+    return {"message": "Life Simulation Backend v15.1 — Header-Agnostic Mode (GPT fully owns all header data)."}

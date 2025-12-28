@@ -8,12 +8,15 @@ import uuid
 
 app = FastAPI(
     title="Life Simulation Game Master Backend API",
-    version="18.0",
-    description="Backend for dark, grounded life simulation with persistent world continuity."
+    version="15.0",
+    description=(
+        "Minimal, AI-authoritative backend for a narrative life simulation. "
+        "This server records and returns the exact world state provided by the Game Master."
+    ),
 )
 
 # -------------------------------------------------------------------
-# FILE PATHS
+# Storage paths
 # -------------------------------------------------------------------
 DATA_DIR = "static"
 LOG_FILE = os.path.join(DATA_DIR, "events.jsonl")
@@ -28,7 +31,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 class ResolveTurnRequest(BaseModel):
     playerId: Optional[str] = None
     summary: str
-    detail: Optional[Any] = None
+    detail: Optional[Any] = None   # may contain header dict or other data
 
 
 class SceneState(BaseModel):
@@ -74,29 +77,20 @@ def load_json(path, default):
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-
 def save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
-
 
 def append_event(event: Event):
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(event.dict(), ensure_ascii=False) + "\n")
 
-
 def load_scene() -> SceneState:
-    """Load the last known scene state. Never invent or reset values."""
     data = load_json(SCENE_FILE, {})
-    if not data:
-        return SceneState()
-    return SceneState(**data)
-
+    return SceneState(**data) if data else SceneState()
 
 def save_scene(scene: SceneState):
-    """Persist the current scene state to disk."""
     save_json(SCENE_FILE, scene.dict())
-
 
 def load_player(player_id: Optional[str]) -> Player:
     players = load_json(PLAYER_FILE, {})
@@ -114,25 +108,21 @@ def load_player(player_id: Optional[str]) -> Player:
     save_json(PLAYER_FILE, players)
     return player
 
-
 def save_player(player: Player):
     players = load_json(PLAYER_FILE, {})
     players[player.playerId] = player.dict()
     save_json(PLAYER_FILE, players)
 
-
 def load_npc_memory() -> Dict[str, NPC]:
     data = load_json(NPC_FILE, {})
     return {k: NPC(**v) for k, v in data.items()}
-
 
 def save_npc_memory(npcs: Dict[str, NPC]):
     data = {k: v.dict() for k, v in npcs.items()}
     save_json(NPC_FILE, data)
 
-
 # -------------------------------------------------------------------
-# META INSTRUCTIONS — GOLDEN RULES (EXACTLY AS PROVIDED)
+# META INSTRUCTIONS — kept exactly as supplied
 # -------------------------------------------------------------------
 @app.get("/api/meta/instructions")
 def get_meta_instructions():
@@ -179,18 +169,16 @@ def get_meta_instructions():
         ),
     }
 
-
 # -------------------------------------------------------------------
-# TURN RESOLUTION — FIXED HEADER MERGE
+# TURN RESOLUTION — pure record mode
 # -------------------------------------------------------------------
 @app.post("/api/turns/resolve")
 def resolve_turn(req: ResolveTurnRequest):
-    """Merge GPT-provided data with stored state, preserving header continuity."""
-    last_scene = load_scene()
+    """Store and echo exactly what the Game Master sends."""
     player = load_player(req.playerId)
     npcs = load_npc_memory()
 
-    # Parse structured world data if present
+    # try to parse provided scene info
     scene_data = {}
     if isinstance(req.detail, dict):
         scene_data = req.detail
@@ -200,36 +188,27 @@ def resolve_turn(req: ResolveTurnRequest):
         except Exception:
             scene_data = {}
 
-    # --- HEADER FIX ---
-    # Merge GPT updates with stored scene, never overwrite with null or reset values
-    merged_scene = SceneState(
-        date=scene_data.get("worldDate") or last_scene.date,
-        time=scene_data.get("worldTime") or last_scene.time,
-        location=scene_data.get("worldLocation") or last_scene.location,
-        funds=scene_data.get("worldFunds") or last_scene.funds,
+    scene = SceneState(
+        date=scene_data.get("worldDate"),
+        time=scene_data.get("worldTime"),
+        location=scene_data.get("worldLocation"),
+        funds=scene_data.get("worldFunds"),
     )
+    save_scene(scene)
 
-    # Guarantee a valid header — if empty, use last stored header
-    if not any([merged_scene.date, merged_scene.time, merged_scene.location, merged_scene.funds]):
-        merged_scene = last_scene
-
-    save_scene(merged_scene)
-
-    # Update minimal NPC data (keeps them alive without overwriting attitude)
     for npc in npcs.values():
         npc.lastInteraction = datetime.utcnow().isoformat() + "Z"
     save_npc_memory(npcs)
 
-    # Log canonical event
     event = Event(
         eventId=str(uuid.uuid4()),
         playerId=player.playerId,
         summary=req.summary,
         detail=json.dumps(req.detail, ensure_ascii=False) if req.detail else None,
-        worldDate=merged_scene.date,
-        worldTime=merged_scene.time,
-        worldLocation=merged_scene.location,
-        worldFunds=merged_scene.funds,
+        worldDate=scene.date,
+        worldTime=scene.time,
+        worldLocation=scene.location,
+        worldFunds=scene.funds,
         timestamp=datetime.utcnow().isoformat() + "Z",
     )
     append_event(event)
@@ -237,12 +216,11 @@ def resolve_turn(req: ResolveTurnRequest):
     return {
         "status": "applied",
         "eventId": event.eventId,
-        "scene": merged_scene.dict(),
+        "scene": scene.dict(),
         "meta": get_meta_instructions(),
         "player": player.dict(),
         "npc": {k: v.dict() for k, v in npcs.items()},
     }
-
 
 # -------------------------------------------------------------------
 # LOG RETRIEVAL
@@ -255,10 +233,11 @@ def get_events(limit: int = 50):
         lines = f.readlines()[-limit:]
     return {"events": [json.loads(line) for line in lines]}
 
-
 # -------------------------------------------------------------------
 # ROOT
 # -------------------------------------------------------------------
 @app.get("/")
 def root():
-    return {"message": "Life Simulation Game Master Backend v18 — header continuity stable."}
+    return {
+        "message": "Life Simulation Game Master Backend v15 — AI-authoritative recorder active."
+    }

@@ -118,6 +118,7 @@ def resolve_turn(req: ResolveTurnRequest):
                 "⏳ PROGRESSION\n"
                 "Advance the world naturally in response to the player’s input. "
                 "Do not stagnate or skip forward arbitrarily; let scenes evolve at a believable pace. "
+                "The user is not telling the story, they are giving you prompts. The story should continue from your last entry. "
                 "Every turn should carry consequence, emotion, or change.\n\n"
                 "🧭 ENGINE ROLE\n"
                 "You run the simulation. Keep continuity intact. "
